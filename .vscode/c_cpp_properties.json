@@ -1,0 +1,25 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/include",
+                "/usr/local/include",
+                "/usr/include/hiredis",
+                "/home/x/桌面/onnxruntime/include"
+            ],
+            "defines": [
+                "BIN_PATH=\"/usr/local/bin\"",
+                "DOC_PATH=\"/usr/local/share/doc/afl\"",
+                "HELPER_PATH=\"/usr/local/lib/afl\"",
+                "_GNU_SOURCE"
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
