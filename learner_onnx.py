@@ -75,6 +75,15 @@ def main():
     TEMP_ONNX = "temp_learner_export.onnx"
     training_step = 0
 
+    # === 配置策略 (与 C 端同步) ===
+    # 1. 预热步数: 在前 1000 次训练中，只优化参数，不更新 Redis。
+    # 这对应 C 端那 50,000 次执行的“静默期”，防止发垃圾模型过去。
+    WARMUP_STEPS = 1000  
+
+    # 2. 导出间隔: 预热结束后，每训练 200 次导出一次。
+    # 不需要太频繁，因为 C 端现在是每 5000 execs 才读一次。
+    EXPORT_INTERVAL = 200
+
     print("[Learner] Waiting for training data from AFL...")
 
     while True:
@@ -104,8 +113,14 @@ def main():
                 
                 training_step += 1
                 
-                # === 定期导出模型 (例如每 1000 次训练) ===
-                if training_step % 1000 == 0:
+                # 情况 A：处于预热期
+                if training_step < WARMUP_STEPS:
+                    # 每 100 步打印一次日志，证明活着，但坚决不导出
+                    if training_step % 100 == 0:
+                        print(f"[Learner] Warming up... Step {training_step}/{WARMUP_STEPS}. Loss={loss.item():.4f}")
+
+                # 情况 B：预热结束，且达到导出间隔
+                elif training_step % EXPORT_INTERVAL == 0:
                     print(f"[Learner] Step {training_step}: Loss={loss.item():.4f}. Exporting model...")
                     
                     # 切换到评估模式导出 (或者保持训练模式以利用 Dropout 做贝叶斯推断，这里按标准导出)
