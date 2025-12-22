@@ -4764,6 +4764,9 @@ static u8 use_nn_scheduling = 1;
 static u8 use_aco_mutation = 1;
 static pid_t learner_pid = 0;
 
+#define WARMUP_THRESHOLD  50000  // 前 50,000 次执行为预热期 (约 30-60秒)
+#define SYNC_INTERVAL     5000   // 预热后，每 5,000 次才检查一次模型 (降低频率)
+
 /* --- 1. 初始化 Redis --- */
 static void init_redis(void) {
   struct timeval timeout = { 1, 500000 }; /* 1.5秒超时 */
@@ -4981,11 +4984,28 @@ static void send_feedback(struct queue_entry* q) {
 
 static u32 calculate_score(struct queue_entry* q) {
 
-  /* 1. 定期检查 Redis 是否有新模型 (例如每1000次调用检查一次) */
-  static u32 sync_counter = 0;
-  if (use_nn_scheduling && ++sync_counter % 1000 == 0) {
-      sync_nn_model();
-  }
+  /* 1. 定期检查 Redis 是否有新模型 */
+static u32 sync_counter = 0;
+++sync_counter; // 每次调用计数器 +1
+
+// 阶段一：预热保护期
+// 如果计数器还没达到阈值，直接跳过同步逻辑，让 AFL 保持原版随机策略跑
+if (sync_counter < WARMUP_THRESHOLD) {
+    // Do nothing. 
+    // 这段时间 Python 端正在疯狂收集数据并训练第一个版本的模型。
+} 
+// 阶段二：正式介入期
+else {
+    // 只有在开启 NN 调度，且满足新的时间间隔时，才去同步
+    if (use_nn_scheduling && (sync_counter % SYNC_INTERVAL == 0)) {
+        sync_nn_model();
+        
+        // 可选：打印一条调试信息，确认预热结束，开始同步
+        // if (sync_counter == WARMUP_THRESHOLD + SYNC_INTERVAL) {
+        //    OKF("Warm-up finished. First model sync triggered!");
+        // }
+    }
+}
   
   /* 2. 准备特征 */
   float features[INPUT_DIM];
