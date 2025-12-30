@@ -35,7 +35,7 @@ class SeedModel(nn.Module):
         out = self.dropout2(out)
         
         out = self.fc3(out)
-        return torch.sigmoid(out) * 3200
+        return torch.sigmoid(out)
 
 # === 2. 辅助函数：强制嵌入权重 ===
 # 解决 ONNX Runtime 加载外部文件导致的段错误问题
@@ -70,7 +70,8 @@ def main():
     
     # 优化器
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    criterion = nn.MSELoss()
+    # 使用二元交叉熵损失函数 (Binary Cross Entropy)
+    criterion = nn.BCELoss()  
     
     TEMP_ONNX = "temp_learner_export.onnx"
     training_step = 0
@@ -165,5 +166,4 @@ def main():
             # 队列为空，稍作休息，避免 CPU 100%
             time.sleep(0.01)
 
-if __name__ == '__main__':
-    main()
+if __name_
