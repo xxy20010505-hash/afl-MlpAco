@@ -166,4 +166,5 @@ def main():
             # 队列为空，稍作休息，避免 CPU 100%
             time.sleep(0.01)
 
-if __name_
+if __name__ == '__main__':
+    main()
