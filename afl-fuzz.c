@@ -2677,7 +2677,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   total_cal_cycles += stage_max;
 
   /* OK, let's collect some stats about the performance of this test case.
-     This is used for fuzzing air time calculations in (). */
+     This is used for fuzzing air time calculations in calculate_score(). */
 
   q->exec_us     = (stop_us - start_us) / stage_max;
   q->bitmap_size = count_bytes(trace_bits);
@@ -4815,8 +4815,8 @@ static void spawn_learner_process(void) {
     // 既然你的代码是在 Dockerfile 里 clone 到 /afl 的
     // 那么脚本的绝对路径一定是 /afl/learner_onnx.py
     // 不要用 "./learner_onnx.py"
-    char* args[] = {"python3", "/afl/learner_onnx.py", NULL};
-    //char* args[] = {"python3", "./learner_onnx.py", NULL};
+    //char* args[] = {"python3", "/afl/learner_onnx.py", NULL};
+    char* args[] = {"python3", "./learner_onnx.py", NULL};
 
     // 4. 执行
     execvp("python3", args);
@@ -4911,8 +4911,8 @@ static void sync_nn_model(void) {
   freeReplyObject(reply_model);
 }
 
-/* --- 5. 推理函数 (计算种子分数) --- */
-static float predict_score(float* features) {
+/* --- 5. 推理函数 (计算种子选择概率) --- */
+static float predict_probability(float* features) {
   if (!ort_session || !g_ort) return -1.0f;
   
   OrtValue* input_tensor = NULL;
@@ -4953,10 +4953,9 @@ static float predict_score(float* features) {
 }
 
 /* --- 6. 发送反馈 (Training Data) --- */
-static void send_feedback(struct queue_entry* q) {
+static void send_feedback(struct queue_entry* q, u8 found_new_path) {
   if (!redis_connected || !redis_ctx) return;
   
-  /* 特征提取 (需与 predict_score 一致) */
   float f[INPUT_DIM];
   f[0] = log10(q->exec_us + 1);
   f[1] = log10(q->len + 1);
@@ -4964,16 +4963,60 @@ static void send_feedback(struct queue_entry* q) {
   f[3] = (float)q->depth;
   f[4] = (float)q->handicap;
   
-  /* Label: 这里简单定义为是否发现新路径 */
-  float label = (q->has_new_cov) ? 1.0f : 0.0f;
+  /* Label: 1.0 = 发现新路径 (Good), 0.0 = 未发现 (Bad) */
+  float label = (found_new_path) ? 1.0f : 0.0f;
   
-  /* 构造 CSV 格式字符串 */
   char buf[256];
   snprintf(buf, sizeof(buf), "%.4f,%.4f,%.4f,%.4f,%.4f|%.2f", f[0], f[1], f[2], f[3], f[4], label);
   
-  /* 异步推送至 Redis */
   redisReply *reply = redisCommand(redis_ctx, "RPUSH train_queue %s", buf);
   if (reply) freeReplyObject(reply);
+}
+
+/* --- 种子选择决策函数 --- */
+/* 返回 1 表示：选中该种子 (Fuzz)
+   返回 0 表示：跳过该种子 (Skip) */
+static u8 neural_should_fuzz(struct queue_entry *q) {
+    
+    /* 1. 同步模型逻辑 (从 calculate_score 移到这里) */
+    static u32 sync_counter = 0;
+    ++sync_counter;
+
+    // 预热期：无条件选中，让 Learner 收集数据
+    if (sync_counter < WARMUP_THRESHOLD) return 1;
+
+    // 定期检查更新
+    if (use_nn_scheduling && (sync_counter % SYNC_INTERVAL == 0)) {
+        sync_nn_model();
+    }
+
+    /* 如果 Redis 断了或者没模型，默认选中，保证 Fuzzer 能跑 */
+    if (!ort_session || !redis_connected) return 1;
+
+    /* 2. 准备特征 */
+    float features[INPUT_DIM];
+    features[0] = log10(q->exec_us + 1);
+    features[1] = log10(q->len + 1);
+    features[2] = log10(q->bitmap_size + 1);
+    features[3] = (float)q->depth;
+    features[4] = (float)q->handicap;
+
+    /* 3. 预测概率 */
+    float prob = predict_probability(features); // 复用现有的推理函数
+
+    if (prob < 0.0f) return 1; // 推理失败，默认选中
+
+    /* 4. 决策策略：Epsilon-Greedy (贪婪 + 随机探索) */
+    /* 我们设定 5% 的概率强制探索“垃圾”种子，防止模型过拟合导致饿死 */
+    float epsilon = 0.05f; 
+    float random_val = (float)(UR(10000)) / 10000.0f;
+
+    if (random_val < epsilon) return 1; // 强制探索
+    if (prob > random_val) return 1;    // 概率性选中 (prob 越高，被选中几率越大)
+    
+    // 或者使用简单的阈值： if (prob > 0.3) return 1;
+
+    return 0; // 跳过
 }
 
 /* ========================================================================= */
@@ -4985,52 +5028,6 @@ static void send_feedback(struct queue_entry* q) {
    go into config.h. */
 
 static u32 calculate_score(struct queue_entry* q) {
-
-  /* 1. 定期检查 Redis 是否有新模型 */
-static u32 sync_counter = 0;
-++sync_counter; // 每次调用计数器 +1
-
-// 阶段一：预热保护期
-// 如果计数器还没达到阈值，直接跳过同步逻辑，让 AFL 保持原版随机策略跑
-if (sync_counter < WARMUP_THRESHOLD) {
-    // Do nothing. 
-    // 这段时间 Python 端正在疯狂收集数据并训练第一个版本的模型。
-} 
-// 阶段二：正式介入期
-else {
-    // 只有在开启 NN 调度，且满足新的时间间隔时，才去同步
-    if (use_nn_scheduling && (sync_counter % SYNC_INTERVAL == 0)) {
-        sync_nn_model();
-        
-        // 可选：打印一条调试信息，确认预热结束，开始同步
-        // if (sync_counter == WARMUP_THRESHOLD + SYNC_INTERVAL) {
-        //    OKF("Warm-up finished. First model sync triggered!");
-        // }
-    }
-}
-  
-  /* 2. 准备特征 */
-  float features[INPUT_DIM];
-  features[0] = log10(q->exec_us + 1);
-  features[1] = log10(q->len + 1);
-  features[2] = log10(q->bitmap_size + 1);
-  features[3] = (float)q->depth;
-  features[4] = (float)q->handicap;
-
-  /* 3. 执行推理 */
-  float nn_prediction = predict_score(features);
-  
-  /* 4. 如果模型有效，使用模型评分 */
-  if (use_nn_scheduling && nn_prediction > 0.0f) {
-      u32 nn_score = (u32)(nn_prediction * 100); 
-      
-      /* 限制范围防止溢出 */
-      if (nn_score < 10) nn_score = 10;
-      if (nn_score > 3200) nn_score = 3200;
-      
-      return nn_score;
-  }
-  /* ==================================== */
 
   u32 avg_exec_us = total_cal_us / total_cal_cycles;
   u32 avg_bitmap_size = total_bitmap_size / total_bitmap_entries;
@@ -6852,12 +6849,6 @@ abandon_entry:
     if (queue_cur->favored) pending_favored--;
   }
 
-  /* ====== 反馈发送逻辑 ====== */
-  if (use_nn_scheduling && !stop_soon) {
-      send_feedback(queue_cur);
-  }
-  /* ==================================== */
-
   munmap(orig_in, queue_cur->len);
 
   if (in_buf != orig_in) ck_free(in_buf);
@@ -8360,7 +8351,57 @@ int main(int argc, char** argv) {
 
     }
 
+    /* ========================================================= */
+    /* [MOD START] 1. 神经网络种子选择 (Seed Selection)            */
+    /* ========================================================= */
+    if (use_nn_scheduling) {
+        /* 询问模型：这个种子值得跑吗？ */
+        /* 返回 0 表示模型认为它是垃圾，直接跳过 */
+        if (neural_should_fuzz(queue_cur) == 0) {
+            
+            /* 统计跳过的数量 */
+            cur_skipped_paths++;
+            
+            /* 移动指针到下一个种子 */
+            queue_cur = queue_cur->next;
+            current_entry++;
+            
+            /* 直接开始下一次循环，不执行 fuzz_one */
+            continue; 
+        }
+    }
+    /* ========================================================= */
+    /* [MOD END]                                                 */
+    /* ========================================================= */
+
+
+    /* 记录 fuzz 之前的状态，用于计算 Feedback */
+    u64 paths_before = queued_paths + unique_crashes;
+
+
+    /* 执行原本的 fuzz 逻辑 */
     skipped_fuzz = fuzz_one(use_argv);
+
+
+    /* ========================================================= */
+    /* [MOD START] 2. 发送训练反馈 (Training Feedback)             */
+    /* ========================================================= */
+    
+    /* 只有当开启了 NN 调度，且 Fuzz 没有被内部逻辑跳过时，才发送反馈 */
+    if (use_nn_scheduling && !stop_soon && !skipped_fuzz) {
+        
+        /* 计算是否发现了新路径或 Crash */
+        u64 paths_after = queued_paths + unique_crashes;
+        u8 found_new = (paths_after > paths_before);
+
+        /* 发送数据给 Python Learner */
+        send_feedback(queue_cur, found_new);
+    }
+    
+    /* ========================================================= */
+    /* [MOD END]                                                 */
+    /* ========================================================= */
+
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
       
