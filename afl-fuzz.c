@@ -2677,7 +2677,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   total_cal_cycles += stage_max;
 
   /* OK, let's collect some stats about the performance of this test case.
-     This is used for fuzzing air time calculations in calculate_score(). */
+     This is used for fuzzing air time calculations in (). */
 
   q->exec_us     = (stop_us - start_us) / stage_max;
   q->bitmap_size = count_bytes(trace_bits);
@@ -4893,6 +4893,8 @@ static void sync_nn_model(void) {
   OrtStatus* status = g_ort->CreateSessionFromArray(ort_env, reply_model->str, reply_model->len, ort_session_options, &new_session);
 
   if (status != NULL) {
+    const char* msg = g_ort->GetErrorMessage(status);
+    WARNF("Model update failed (Version: %s): %s", reply_ver->str, msg);
     g_ort->ReleaseStatus(status);
   } else {
     /* 替换成功，释放旧 Session */
@@ -4902,7 +4904,7 @@ static void sync_nn_model(void) {
     if (last_model_version) ck_free(last_model_version);
     last_model_version = ck_strdup(reply_ver->str);
     
-    OKF("NN Model updated (Size: %zu bytes)", reply_model->len);
+    OKF("NN Model updated to Version: %s (Size: %zu bytes)", reply_ver->str, reply_model->len);
   }
   
   freeReplyObject(reply_ver);
