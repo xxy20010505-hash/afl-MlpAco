@@ -4815,8 +4815,8 @@ static void spawn_learner_process(void) {
     // 既然你的代码是在 Dockerfile 里 clone 到 /afl 的
     // 那么脚本的绝对路径一定是 /afl/learner_onnx.py
     // 不要用 "./learner_onnx.py"
-    //char* args[] = {"python3", "/afl/learner_onnx.py", NULL};
-    char* args[] = {"python3", "./learner_onnx.py", NULL};
+    char* args[] = {"python3", "/afl/learner_onnx.py", NULL};
+    //char* args[] = {"python3", "./learner_onnx.py", NULL};
 
     // 4. 执行
     execvp("python3", args);
