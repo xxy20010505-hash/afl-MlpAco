@@ -3483,7 +3483,8 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
              "afl_version       : " VERSION "\n"
              "target_mode       : %s%s%s%s%s%s%s\n"
              "command_line      : %s\n"
-             "slowest_exec_ms   : %llu\n",
+             "slowest_exec_ms   : %llu\n"
+             "total_skipped     : %llu\n",
              start_time / 1000, get_cur_time() / 1000, getpid(),
              queue_cycle ? (queue_cycle - 1) : 0, total_execs, eps,
              queued_paths, queued_favored, queued_discovered, queued_imported,
@@ -4751,6 +4752,8 @@ static u32 choose_block_len(u32 limit) {
 /* --- 全局变量定义 --- */
 static redisContext *redis_ctx = NULL;
 static u8 redis_connected = 0;
+
+EXP_ST u64 total_skipped_paths = 0; /* Total number of skipped inputs by MLP */
 
 static const OrtApi* g_ort = NULL;
 static OrtEnv* ort_env = NULL;
@@ -8361,7 +8364,7 @@ int main(int argc, char** argv) {
             
             /* 统计跳过的数量 */
             cur_skipped_paths++;
-            
+            total_skipped_paths++;
             /* 移动指针到下一个种子 */
             queue_cur = queue_cur->next;
             current_entry++;
