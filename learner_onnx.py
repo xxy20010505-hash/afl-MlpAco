@@ -9,7 +9,7 @@ import onnx
 from onnx.external_data_helper import load_external_data_for_model
 
 # === 1. 定义模型 ===
-# 必须与 C 代码中的 INPUT_DIM = 5 保持一致
+# 必须与 C 代码中的 INPUT_DIM = 6 保持一致
 # 特征顺序: [exec_us, len, bitmap_size, depth, handicap]
 class SeedModel(nn.Module):
     def __init__(self, input_dim):
@@ -64,7 +64,7 @@ def main():
         return
 
     # 初始化
-    INPUT_DIM = 5
+    INPUT_DIM = 6
     model = SeedModel(INPUT_DIM)
     model.train() # 启用 Dropout
     
@@ -82,8 +82,10 @@ def main():
     WARMUP_STEPS = 1000  
 
     # 2. 导出间隔: 预热结束后，每训练 200 次导出一次。
-    # 不需要太频繁，因为 C 端现在是每 5000 execs 才读一次。
-    EXPORT_INTERVAL = 200
+    # 不需要太频繁，因为 C 端现在是每 1000 execs 才读一次。
+    # EXPORT_INTERVAL = 200
+    # Python 端无论训练多快，都强制每 60 秒导出一次。
+    last_export_time = time.time()
 
     print("[Learner] Waiting for training data from AFL...")
 
@@ -121,8 +123,8 @@ def main():
                         print(f"[Learner] Warming up... Step {training_step}/{WARMUP_STEPS}. Loss={loss.item():.4f}")
 
                 # 情况 B：预热结束，且达到导出间隔
-                elif training_step % EXPORT_INTERVAL == 0:
-                    print(f"[Learner] Step {training_step}: Loss={loss.item():.4f}. Exporting model...")
+                elif time.time() - last_export_time > 60:
+                    print(f"[Learner] Time {time.time()}: Loss={loss.item():.4f}. Exporting model...")
                     
                     # 切换到评估模式导出 (或者保持训练模式以利用 Dropout 做贝叶斯推断，这里按标准导出)
                     model.eval()
@@ -156,6 +158,8 @@ def main():
                     # 5. 清理临时文件
                     if os.path.exists(TEMP_ONNX): os.remove(TEMP_ONNX)
                     if os.path.exists(TEMP_ONNX + ".data"): os.remove(TEMP_ONNX + ".data")
+
+                    last_export_time = time.time()
                     
                     # 恢复训练模式
                     model.train()
