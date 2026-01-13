@@ -116,6 +116,8 @@ EXP_ST u32 cpu_to_bind = 0;           /* id of free CPU core to bind      */
 
 static u32 stats_update_freq = 1;     /* Stats update frequency (execs)   */
 
+EXP_ST u64 total_skipped_paths = 0; /* Total number of skipped inputs by MLP */
+
 EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            force_deterministic,       /* Force deterministic stages?      */
            use_splicing,              /* Recombine input files?           */
@@ -258,7 +260,8 @@ struct queue_entry {
       fs_redundant;                   /* Marked as redundant in the fs?   */
 
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
-      exec_cksum;                     /* Checksum of the execution trace  */
+      exec_cksum,                     /* Checksum of the execution trace  */
+      n_fuzz_entry;                   /* 种子被fuzz次数  */
 
   u64 exec_us,                        /* Execution time (us)              */
       handicap,                       /* Number of queue cycles behind    */
@@ -816,6 +819,9 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->passed_det   = passed_det;
 
   if (q->depth > max_depth) max_depth = q->depth;
+
+  /* 显式初始化为 0，确保每个新种子都是清白之身 */
+  q->n_fuzz_entry = 0;
 
   if (queue_top) {
 
@@ -3498,7 +3504,7 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
              persistent_mode ? "persistent " : "", deferred_mode ? "deferred " : "",
              (qemu_mode || dumb_mode || no_forkserver || crash_mode ||
               persistent_mode || deferred_mode) ? "" : "default",
-             orig_cmdline, slowest_exec_ms);
+             orig_cmdline, slowest_exec_ms, total_skipped_paths);
              /* ignore errors */
 
   /* Get rss value from the children
@@ -4753,22 +4759,22 @@ static u32 choose_block_len(u32 limit) {
 static redisContext *redis_ctx = NULL;
 static u8 redis_connected = 0;
 
-EXP_ST u64 total_skipped_paths = 0; /* Total number of skipped inputs by MLP */
-
 static const OrtApi* g_ort = NULL;
 static OrtEnv* ort_env = NULL;
 static OrtSession* ort_session = NULL;
 static OrtSessionOptions* ort_session_options = NULL;
 static OrtMemoryInfo* ort_memory_info = NULL;
 
-#define INPUT_DIM 5  /* 必须与 Python 端一致 */
+#define INPUT_DIM 6  /* 必须与 Python 端一致 */
 static char* last_model_version = NULL;
 static u8 use_nn_scheduling = 1;
 static u8 use_aco_mutation = 1;
 static pid_t learner_pid = 0;
 
+#define DET_EXEC_LIMIT    20000  // 确定性变异次数
 #define WARMUP_THRESHOLD  50000  // 前 50,000 次执行为预热期 (约 30-60秒)
-#define SYNC_INTERVAL     5000   // 预热后，每 5,000 次才检查一次模型 (降低频率)
+#define SYNC_INTERVAL     1000   // 预热后，每 1,000 次才检查一次模型 (降低频率)
+#define OVERUSE_THRESHOLD 50.0f  // 种子fuzz次数阈值
 
 /* --- 1. 初始化 Redis --- */
 static void init_redis(void) {
@@ -4818,8 +4824,8 @@ static void spawn_learner_process(void) {
     // 既然你的代码是在 Dockerfile 里 clone 到 /afl 的
     // 那么脚本的绝对路径一定是 /afl/learner_onnx.py
     // 不要用 "./learner_onnx.py"
-    char* args[] = {"python3", "/afl/learner_onnx.py", NULL};
-    //char* args[] = {"python3", "./learner_onnx.py", NULL};
+    //char* args[] = {"python3", "/afl/learner_onnx.py", NULL};
+    char* args[] = {"python3", "./learner_onnx.py", NULL};
 
     // 4. 执行
     execvp("python3", args);
@@ -4885,7 +4891,7 @@ static void sync_nn_model(void) {
   }
 
   /* 版本变了，下载模型数据 */
-  // ACTF("Fetching new NN model... (Version: %s)", reply_ver->str); // 可选：打印日志
+  ACTF("Fetching new NN model... (Version: %s)", reply_ver->str); // 可选：打印日志
   redisReply *reply_model = redisCommand(redis_ctx, "GET global_model_main");
   if (!reply_model || reply_model->type != REDIS_REPLY_STRING) {
     freeReplyObject(reply_ver); if(reply_model) freeReplyObject(reply_model); return;
@@ -4965,12 +4971,27 @@ static void send_feedback(struct queue_entry* q, u8 found_new_path) {
   f[2] = log10(q->bitmap_size + 1);
   f[3] = (float)q->depth;
   f[4] = (float)q->handicap;
+
+  /* 获取使用次数 */
+  float use_count = (float)q->n_fuzz_entry;
+
+  /* 计算“超限比率” (Ratio) */
+  float ratio = use_count / OVERUSE_THRESHOLD;
+
+  /* 核心公式：Log信息 * 衰减系数
+    1. log10(use_count + 1): 基础特征，表示"探索深度"。
+    2. 1.0f / (1.0f + ratio * ratio): 衰减系数。
+        - 次数很少时，ratio接近0，系数接近1 (无惩罚)。
+        - 次数=阈值时，ratio=1，系数=0.5 (半衰)。
+        - 次数很多时，ratio很大，系数迅速趋近0 (强惩罚)。
+  */
+  f[5] = log10(use_count + 1) * (1.0f / (1.0f + ratio * ratio));
   
   /* Label: 1.0 = 发现新路径 (Good), 0.0 = 未发现 (Bad) */
   float label = (found_new_path) ? 1.0f : 0.0f;
   
   char buf[256];
-  snprintf(buf, sizeof(buf), "%.4f,%.4f,%.4f,%.4f,%.4f|%.2f", f[0], f[1], f[2], f[3], f[4], label);
+  snprintf(buf, sizeof(buf), "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f|%.2f", f[0], f[1], f[2], f[3], f[4], f[5] ,label);
   
   redisReply *reply = redisCommand(redis_ctx, "RPUSH train_queue %s", buf);
   if (reply) freeReplyObject(reply);
@@ -4983,14 +5004,21 @@ static u8 neural_should_fuzz(struct queue_entry *q) {
     
     /* 1. 同步模型逻辑 (从 calculate_score 移到这里) */
     static u32 sync_counter = 0;
+    static u64 last_sync_time = 0;
+    u64 current_time = get_cur_time();
     ++sync_counter;
 
     // 预热期：无条件选中，让 Learner 收集数据
-    if (sync_counter < WARMUP_THRESHOLD) return 1;
+    if (total_execs < WARMUP_THRESHOLD) return 1;
+
+    //确定性变异时间减少
+    if (!skip_deterministic && total_execs > DET_EXEC_LIMIT) skip_deterministic = 1;;
 
     // 定期检查更新
-    if (use_nn_scheduling && (sync_counter % SYNC_INTERVAL == 0)) {
+    if (use_nn_scheduling && (current_time - last_sync_time > 30000)) {
         sync_nn_model();
+        last_sync_time = current_time;
+        ACTF("Syncing model at %llu ms", current_time); // 可选日志
     }
 
     /* 如果 Redis 断了或者没模型，默认选中，保证 Fuzzer 能跑 */
@@ -5003,6 +5031,21 @@ static u8 neural_should_fuzz(struct queue_entry *q) {
     features[2] = log10(q->bitmap_size + 1);
     features[3] = (float)q->depth;
     features[4] = (float)q->handicap;
+    
+    /* 获取使用次数 */
+    float use_count = (float)q->n_fuzz_entry;
+
+    /* 计算“超限比率” (Ratio) */
+    float ratio = use_count / OVERUSE_THRESHOLD;
+
+    /* 核心公式：Log信息 * 衰减系数
+      1. log10(use_count + 1): 基础特征，表示"探索深度"。
+      2. 1.0f / (1.0f + ratio * ratio): 衰减系数。
+          - 次数很少时，ratio接近0，系数接近1 (无惩罚)。
+          - 次数=阈值时，ratio=1，系数=0.5 (半衰)。
+          - 次数很多时，ratio很大，系数迅速趋近0 (强惩罚)。
+    */
+    features[5] = log10(use_count + 1) * (1.0f / (1.0f + ratio * ratio));
 
     /* 3. 预测概率 */
     float prob = predict_probability(features); // 复用现有的推理函数
@@ -5298,6 +5341,9 @@ static u8 fuzz_one(char** argv) {
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
+
+  /* 每次进入 fuzz_one，说明该种子被选中了一次 */
+  queue_cur->n_fuzz_entry++;
 
 #ifdef IGNORE_FINDS
 
