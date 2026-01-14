@@ -69,7 +69,7 @@ def main():
     model.train() # 启用 Dropout
     
     # 优化器
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=0.0001)
     # 使用二元交叉熵损失函数 (Binary Cross Entropy)
     criterion = nn.BCELoss()  
     
