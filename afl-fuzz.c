@@ -4875,45 +4875,70 @@ static void init_onnx_env(void) {
 static void sync_nn_model(void) {
   if (!redis_connected || !redis_ctx || !g_ort) return;
 
-  /* 先检查版本号，减少开销 */
+  /* 1. 获取版本号 */
   redisReply *reply_ver = redisCommand(redis_ctx, "GET global_model_version");
+  
+  /* [DEBUG] 检查 Redis 命令是否失败 */
   if (!reply_ver) { 
-      /* Redis 可能断开 */
+      WARNF("Redis command 'GET global_model_version' failed (NULL reply).");
+      /* 发生严重错误，断开连接 */
       redisFree(redis_ctx); redis_ctx = NULL; redis_connected = 0; 
       return; 
   }
-  if (reply_ver->type != REDIS_REPLY_STRING) { freeReplyObject(reply_ver); return; }
 
-  /* 版本没变，无需操作 */
+  /* [DEBUG] 检查 Key 是否存在 (处理预热期 NIL 情况) */
+  if (reply_ver->type == REDIS_REPLY_NIL) {
+      /* 说明 Python 还没生成第一个模型 */
+      // ACTF("Model not ready yet (Redis key not found). Waiting for Learner..."); 
+      freeReplyObject(reply_ver);
+      return;
+  }
+
+  /* 类型检查 */
+  if (reply_ver->type != REDIS_REPLY_STRING) { 
+      WARNF("Unexpected Redis reply type: %d", reply_ver->type);
+      freeReplyObject(reply_ver); 
+      return; 
+  }
+
+  /* 2. 检查版本是否变化 */
   if (last_model_version && !strcmp(last_model_version, reply_ver->str)) {
-    freeReplyObject(reply_ver);
+      /* [DEBUG] 版本一致，静默退出是正常的 */
+      /* 如果你想确认它确实跑了，可以把下面这行注释打开，但日志会很多 */
+      OKF("Model version unchanged (%s). Skipping.", last_model_version);
+      
+      freeReplyObject(reply_ver);
+      return;
+  }
+
+  /* === 版本变了，开始更新 === */
+  ACTF("Fetching new NN model... (New Version: %s)", reply_ver->str);
+
+  redisReply *reply_model = redisCommand(redis_ctx, "GET global_model_main");
+  if (!reply_model || reply_model->type != REDIS_REPLY_STRING) {
+    WARNF("Failed to fetch model body or invalid type.");
+    freeReplyObject(reply_ver); 
+    if(reply_model) freeReplyObject(reply_model); 
     return;
   }
 
-  /* 版本变了，下载模型数据 */
-  ACTF("Fetching new NN model... (Version: %s)", reply_ver->str); // 可选：打印日志
-  redisReply *reply_model = redisCommand(redis_ctx, "GET global_model_main");
-  if (!reply_model || reply_model->type != REDIS_REPLY_STRING) {
-    freeReplyObject(reply_ver); if(reply_model) freeReplyObject(reply_model); return;
-  }
-
-  /* 从内存直接加载新 Session */
+  /* 加载 Session */
   OrtSession* new_session = NULL;
   OrtStatus* status = g_ort->CreateSessionFromArray(ort_env, reply_model->str, reply_model->len, ort_session_options, &new_session);
 
   if (status != NULL) {
     const char* msg = g_ort->GetErrorMessage(status);
-    WARNF("Model update failed (Version: %s): %s", reply_ver->str, msg);
+    WARNF("Model update failed: %s", msg);
     g_ort->ReleaseStatus(status);
   } else {
-    /* 替换成功，释放旧 Session */
+    /* 替换成功 */
     if (ort_session) g_ort->ReleaseSession(ort_session);
     ort_session = new_session;
     
     if (last_model_version) ck_free(last_model_version);
     last_model_version = ck_strdup(reply_ver->str);
     
-    OKF("NN Model updated to Version: %s (Size: %zu bytes)", reply_ver->str, reply_model->len);
+    OKF("NN Model updated successfully to Version: %s", reply_ver->str);
   }
   
   freeReplyObject(reply_ver);
@@ -5016,6 +5041,7 @@ static u8 neural_should_fuzz(struct queue_entry *q) {
 
     // 定期检查更新
     if (use_nn_scheduling && (current_time - last_sync_time > 30000)) {
+        ACTF("Triggering sync_nn_model check..."); // 可选日志
         sync_nn_model();
         last_sync_time = current_time;
         ACTF("Syncing model at %llu ms", current_time); // 可选日志
