@@ -4873,50 +4873,49 @@ static void init_onnx_env(void) {
 
 /* --- 4. 模型同步 (内存热替换) --- */
 static void sync_nn_model(void) {
-  if (!redis_connected || !redis_ctx || !g_ort) return;
-
+  if (!redis_connected || !redis_ctx || !g_ort) {
+    WARNF("[Sync] Aborted: redis wrong");
+    return;
+  }
+  
   /* 1. 获取版本号 */
   redisReply *reply_ver = redisCommand(redis_ctx, "GET global_model_version");
   
-  /* [DEBUG] 检查 Redis 命令是否失败 */
   if (!reply_ver) { 
-      WARNF("Redis command 'GET global_model_version' failed (NULL reply).");
-      /* 发生严重错误，断开连接 */
+      WARNF("[Sync] Redis command failed (NULL reply). Connection lost?");
       redisFree(redis_ctx); redis_ctx = NULL; redis_connected = 0; 
       return; 
   }
 
-  /* [DEBUG] 检查 Key 是否存在 (处理预热期 NIL 情况) */
+  /* [诊断点 2] 重点检查这里！是否是 NIL */
   if (reply_ver->type == REDIS_REPLY_NIL) {
-      /* 说明 Python 还没生成第一个模型 */
-      // ACTF("Model not ready yet (Redis key not found). Waiting for Learner..."); 
+      /* 强制打印！不要注释掉！ */
+      OKF("[Sync] Python hasn't created the model yet (Key is NIL). Waiting...");
       freeReplyObject(reply_ver);
       return;
   }
 
   /* 类型检查 */
   if (reply_ver->type != REDIS_REPLY_STRING) { 
-      WARNF("Unexpected Redis reply type: %d", reply_ver->type);
+      WARNF("[Sync] Unexpected Redis reply type: %d", reply_ver->type);
       freeReplyObject(reply_ver); 
       return; 
   }
 
   /* 2. 检查版本是否变化 */
   if (last_model_version && !strcmp(last_model_version, reply_ver->str)) {
-      /* [DEBUG] 版本一致，静默退出是正常的 */
-      /* 如果你想确认它确实跑了，可以把下面这行注释打开，但日志会很多 */
-      OKF("Model version unchanged (%s). Skipping.", last_model_version);
-      
+      /* 强制打印！ */
+      OKF("[Sync] Version matched (%s). No update needed.", last_model_version);
       freeReplyObject(reply_ver);
       return;
   }
 
   /* === 版本变了，开始更新 === */
-  ACTF("Fetching new NN model... (New Version: %s)", reply_ver->str);
+  ACTF("[Sync] Fetching new NN model... (New Version: %s)", reply_ver->str);
 
   redisReply *reply_model = redisCommand(redis_ctx, "GET global_model_main");
   if (!reply_model || reply_model->type != REDIS_REPLY_STRING) {
-    WARNF("Failed to fetch model body or invalid type.");
+    WARNF("[Sync] Failed to fetch model body or invalid type.");
     freeReplyObject(reply_ver); 
     if(reply_model) freeReplyObject(reply_model); 
     return;
@@ -4928,7 +4927,7 @@ static void sync_nn_model(void) {
 
   if (status != NULL) {
     const char* msg = g_ort->GetErrorMessage(status);
-    WARNF("Model update failed: %s", msg);
+    WARNF("[Sync] Model update failed: %s", msg);
     g_ort->ReleaseStatus(status);
   } else {
     /* 替换成功 */
@@ -4938,7 +4937,7 @@ static void sync_nn_model(void) {
     if (last_model_version) ck_free(last_model_version);
     last_model_version = ck_strdup(reply_ver->str);
     
-    OKF("NN Model updated successfully to Version: %s", reply_ver->str);
+    OKF("[Sync] SUCCESS! Model updated to Version: %s", reply_ver->str);
   }
   
   freeReplyObject(reply_ver);
