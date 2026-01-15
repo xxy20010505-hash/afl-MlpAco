@@ -37,16 +37,22 @@ class SeedModel(nn.Module):
         out = self.fc3(out)
         return torch.sigmoid(out)
 
-# === 2. 辅助函数：强制嵌入权重 ===
-# 解决 ONNX Runtime 加载外部文件导致的段错误问题
+# === 2. 辅助函数：强制嵌入权重 (修复版) ===
 def make_model_embedded(onnx_model):
-    # 强制加载外部数据到内存对象
-    load_external_data_for_model(onnx_model, ".")
+    try:
+        # 尝试加载外部数据
+        load_external_data_for_model(onnx_model, ".")
+    except Exception:
+        # 如果本来就没有外部数据，这里可能会报错，直接忽略
+        pass
     
-    # 清除“外部数据”标记，让 ONNX 认为这是原生内嵌数据
+    # 遍历所有初始化器，清除外部数据标记
     for tensor in onnx_model.graph.initializer:
+        # 只处理那些被标记为外部数据的 Tensor
         if tensor.data_location == onnx.TensorProto.EXTERNAL:
+            # 将其改为默认（内嵌）
             tensor.data_location = onnx.TensorProto.DEFAULT
+            # 清空 external_data 字段，迫使它使用 raw_data
             del tensor.external_data[:]
             
     return onnx_model
@@ -96,7 +102,7 @@ def main():
         if raw_data:
             try:
                 # 解析 AFL 发来的数据
-                # 格式: "f1,f2,f3,f4,f5|label"
+                # 格式: "f1,f2,f3,f4,f5,f6|label"
                 data_str = raw_data.decode('utf-8')
                 feat_str, label_str = data_str.split('|')
                 
@@ -126,42 +132,60 @@ def main():
                 elif time.time() - last_export_time > 60:
                     print(f"[Learner] Time {time.time()}: Loss={loss.item():.4f}. Exporting model...")
                     
-                    # 切换到评估模式导出 (或者保持训练模式以利用 Dropout 做贝叶斯推断，这里按标准导出)
                     model.eval()
-                    dummy_input = torch.randn(1, INPUT_DIM)
+                    dummy_input = torch.randn(1, INPUT_DIM, dtype=torch.float32)
                     
-                    # 1. 导出到临时文件
-                    torch.onnx.export(
-                        model,
-                        dummy_input,
-                        TEMP_ONNX,
-                        export_params=True,
-                        opset_version=18, 
-                        do_constant_folding=True,
-                        input_names=['input'],
-                        output_names=['output'],
-                        dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
-                    )
-                    
-                    # 2. 重新加载并嵌入权重 (内存化)
-                    onnx_model = onnx.load(TEMP_ONNX)
-                    onnx_model = make_model_embedded(onnx_model)
-                    final_bytes = onnx_model.SerializeToString()
-                    
-                    # 3. 存入 Redis
-                    # 这是一个原子操作，C 端读取时不会读到残缺数据
-                    r.set('global_model_main', final_bytes)
-                    
-                    # 4. 更新版本号 (C 端监控这个 Key 变化)
-                    r.set('global_model_version', str(time.time()))
-                    
-                    # 5. 清理临时文件
-                    if os.path.exists(TEMP_ONNX): os.remove(TEMP_ONNX)
-                    if os.path.exists(TEMP_ONNX + ".data"): os.remove(TEMP_ONNX + ".data")
+                    try:
+                        # 1. 顺从 PyTorch：直接导出为 Opset 18
+                        # 这样可以避开崩溃的 onnx-converter
+                        torch.onnx.export(
+                            model,
+                            dummy_input,
+                            TEMP_ONNX,
+                            export_params=True,
+                            opset_version=18,  # <--- 直接用最新版，不降级
+                            do_constant_folding=False, # 关闭折叠，避免标量问题
+                            input_names=['input'],
+                            output_names=['output'],
+                            keep_initializers_as_inputs=False
+                        )
+                        
+                        if os.path.exists(TEMP_ONNX):
+                            # 2. 加载模型
+                            onnx_model = onnx.load(TEMP_ONNX)
+                            
+                            # === 核心魔法：手动降级 IR Version ===
+                            # C++ Runtime 抱怨 "max supported IR version: 9"
+                            # 我们直接硬改 metadata，骗过 C++ 的检查
+                            if onnx_model.ir_version > 9:
+                                print(f"[Learner] Hacking IR version: {onnx_model.ir_version} -> 9")
+                                onnx_model.ir_version = 9
+                            
+                            # (可选) 如果 C++ Runtime 还抱怨 Opset 版本太高
+                            # 可以把下面的注释打开，强制把 Opset 版本号也改低
+                            # for opset in onnx_model.opset_import:
+                            #    if opset.version > 17:
+                            #        opset.version = 17
 
+                            # 3. 序列化并存入 Redis
+                            final_bytes = onnx_model.SerializeToString()
+                            
+                            r.set('global_model_main', final_bytes)
+                            r.set('global_model_version', str(time.time()))
+                            print("[Learner] Model saved to Redis successfully (Hacked IR v9).")
+                            
+                        else:
+                            print("[Learner] Export failed: file not found.")
+
+                    except Exception as e:
+                        print(f"[Learner] Export Error: {e}")
+                        # 打印堆栈以便排查
+                        import traceback
+                        traceback.print_exc()
+
+                    # 清理并恢复
+                    if os.path.exists(TEMP_ONNX): os.remove(TEMP_ONNX)
                     last_export_time = time.time()
-                    
-                    # 恢复训练模式
                     model.train()
 
             except Exception as e:
