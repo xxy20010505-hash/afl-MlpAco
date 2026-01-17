@@ -4808,30 +4808,54 @@ static void spawn_learner_process(void) {
   
   if (!learner_pid) {
     /* 子进程 (Learner) */
+    
+    // 关闭不需要的文件描述符，防止干扰
     close(dev_null_fd);
     close(dev_urandom_fd);
     
-    // 2. 【关键】重定向输出到文件，而不是 /dev/null
-    // 这样如果缺库或者路径不对，你能在 logs 目录下看到报错！
+    // =========================================================
+    // 1. 【持久化关键】重定向到 /out 目录
+    // =========================================================
+    // FuzzBench 挂载卷在 /out，写在这里的文件即使容器删了也会留在宿主机硬盘上
     int log_fd = open("/out/python_learner.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    
     if (log_fd >= 0) {
-        dup2(log_fd, 1); // stdout
-        dup2(log_fd, 2); // stderr
+        // 重定向标准输出 (print)
+        if (dup2(log_fd, STDOUT_FILENO) == -1) {
+            // 如果重定向失败，尝试往 stderr 写一句作为最后的挣扎
+            fprintf(stderr, "FATAL: dup2 stdout failed\n");
+        }
+        // 重定向标准错误 (Traceback报错)
+        if (dup2(log_fd, STDERR_FILENO) == -1) {
+            fprintf(stderr, "FATAL: dup2 stderr failed\n");
+        }
+        // 既然已经复制给了 1 和 2，原始的 fd 就可以关了
         close(log_fd);
+    } else {
+        // 如果连日志文件都打不开（极少见，除非权限问题），尝试打印到标准错误
+        // 在 Docker logs 中或许能看到
+        fprintf(stderr, "FATAL: Could not open /out/python_learner.log: %s\n", strerror(errno));
     }
 
-    // 3. 【关键】使用绝对路径！
-    // 既然你的代码是在 Dockerfile 里 clone 到 /afl 的
-    // 那么脚本的绝对路径一定是 /afl/learner_onnx.py
-    // 不要用 "./learner_onnx.py"
-    char* args[] = {"python3", "/afl/learner_onnx.py", NULL};
-    //char* args[] = {"python3", "./learner_onnx.py", NULL};
+    // =========================================================
+    // 2. 【防丢日志关键】加上 "-u" 参数
+    // =========================================================
+    // "-u" 表示 unbuffered（无缓冲）。
+    // 确保 Python 的 print 和报错信息直接写入文件，而不是卡在内存里。
+    // 如果不加这个，脚本崩溃时的报错往往写不进去，导致你看到一个空文件！
+    
+    // 请确认你的 Dockerfile 里确实把 learner_onnx.py 放到了 /afl/ 目录下
+    // 如果是用 FuzzBench 标准 COPY，通常也在 /out/ 下，请核实路径！
+    char* args[] = {"python3", "-u", "/afl/learner_onnx.py", NULL};
 
-    // 4. 执行
+    // 3. 执行
     execvp("python3", args);
 
-    // 5. 如果代码走到这里，说明启动失败了
-    printf("FATAL: Failed to start python script! Error: %s\n", strerror(errno));
+    // 4. 如果代码走到这里，说明 execvp 失败了（比如找不到 python3 或脚本路径不对）
+    // 这个 printf 会被写入到 python_learner.log 中（因为上面 dup2 了）
+    printf("FATAL: Failed to execute python script! errno=%d, error: %s\n", errno, strerror(errno));
+    
+    // 必须退出，否则子进程会继续执行父进程的代码
     exit(1);
   }
 }
