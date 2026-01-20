@@ -83,13 +83,13 @@ def main():
     training_step = 0
 
     # === 配置策略 (与 C 端同步) ===
-    # 1. 预热步数: 在前 1000 次训练中，只优化参数，不更新 Redis。
+    # 1. 预热步数: 在前 500 次训练中，只优化参数，不更新 Redis。
     # 这对应 C 端那 50,000 次执行的“静默期”，防止发垃圾模型过去。
-    WARMUP_STEPS = 1000  
+    WARMUP_STEPS = 500  
 
-    # 2. 导出间隔: 预热结束后，每训练 200 次导出一次。
+    # 2. 导出间隔: 预热结束后，每训练 100 次导出一次。
     # 不需要太频繁，因为 C 端现在是每 1000 execs 才读一次。
-    # EXPORT_INTERVAL = 200
+    # EXPORT_INTERVAL = 100
     # Python 端无论训练多快，都强制每 60 秒导出一次。
     last_export_time = time.time()
 
