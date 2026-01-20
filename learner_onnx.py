@@ -147,7 +147,7 @@ def main():
 
             # 情况 A：处于预热期
             if training_step < WARMUP_STEPS:
-                if training_step % 50 == 0: # 稍微减少打印频率
+                if training_step % 100 == 0: # 稍微减少打印频率
                     print(f"[Learner] Warming up... Batch {training_step}/{WARMUP_STEPS}. Loss={loss.item():.4f}")
 
             # 情况 B：预热结束，且达到导出间隔
