@@ -152,7 +152,7 @@ def main():
 
             # 情况 B：预热结束，且达到导出间隔
             elif time.time() - last_export_time > 60:
-                print(f"[Learner] Time {time.time()}: Loss={loss.item():.4f}. Exporting model...")
+                # print(f"[Learner] Time {time.time()}: Loss={loss.item():.4f}. Exporting model...")
                 
                 model.eval()
                 # 导出时只需要一个 dummy 输入即可，batch size 可以是 1
@@ -183,7 +183,7 @@ def main():
                         
                         r.set('global_model_main', final_bytes)
                         r.set('global_model_version', str(time.time()))
-                        print("[Learner] Model saved to Redis successfully.")
+                        # print("[Learner] Model saved to Redis successfully.")
                         
                     else:
                         print("[Learner] Export failed: file not found.")
