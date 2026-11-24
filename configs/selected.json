@@ -1,0 +1,45 @@
+{
+  "decision_date": "2026-11-12",
+  "status": "user-selected final design for subsequent FuzzBench and LAVA-M evaluation; not established as optimal",
+  "MLP": {
+    "architecture": [
+      6,
+      64,
+      32,
+      1
+    ],
+    "dropout": 0.2,
+    "T": 8,
+    "lambda": 1,
+    "score": "clip(mean + lambda * sample_std, 0, 1)",
+    "selection": "existing shared-uniform rule, acceptance approximately max(0.05, score)",
+    "loss": "BCE",
+    "optimizer": "Adam",
+    "learning_rate": 0.0001,
+    "max_batch_size": 64,
+    "warmup_batch_updates": 500,
+    "actor_warmup_executions": 50000,
+    "publication_interval_seconds": 60,
+    "version_check_interval_ms": 30000
+  },
+  "ACO": {
+    "variant": "original from real-library comparisons; revised implementation with hierarchical rewards and global evaporation",
+    "rho": 0.0001,
+    "alpha": 1,
+    "beta": 1.5,
+    "small_reward": 1,
+    "big_reward": 5,
+    "pheromone_min": 0.1,
+    "pheromone_max": 100,
+    "recent_history": false,
+    "explicit_uniform_exploration": 0,
+    "heuristic": "lifetime hits/tries with original cold-start handling"
+  },
+  "runtime": {
+    "async_model_loading": true,
+    "atomic_model_publication": true,
+    "havoc_stage_cap": null,
+    "feedback_RPUSH": "synchronous"
+  },
+  "evaluation": "Formal FuzzBench/LAVA-M runs are pending. Earlier capped cold-start runs are preliminary and must not be pooled with formal results."
+}

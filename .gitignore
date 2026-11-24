@@ -18,3 +18,18 @@ afl-llvm-pass.so
 afl-llvm-rt-32.o
 afl-llvm-rt-64.o
 afl-llvm-rt.o
+
+# Local caches and generated validation artifacts.
+__pycache__/
+*.py[cod]
+validation/out-*/
+validation/**/work/
+validation/**/traces/
+validation/**/.git/
+validation/*.log
+validation/*-results.*
+validation/*-summary.txt
+validation/check
+validation/aco_check
+validation/target
+validation/*.onnx

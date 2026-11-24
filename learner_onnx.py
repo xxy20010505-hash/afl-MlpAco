@@ -57,7 +57,7 @@ def make_model_embedded(onnx_model):
 # === 3. 主循环 ===
 def main():
     try:
-        r = redis.Redis(host='localhost', port=6379, db=0)
+        r = redis.Redis(host='localhost', port=int(os.getenv('AFL_REDIS_PORT', '6379')), db=0)
         r.ping()
         print("[Learner] Successfully connected to Redis.")
     except Exception as e:
@@ -65,6 +65,8 @@ def main():
         return
 
     # 初始化
+    if os.getenv("AFL_TORCH_SEED"):
+        torch.manual_seed(int(os.environ["AFL_TORCH_SEED"]))
     INPUT_DIM = 6
     model = SeedModel(INPUT_DIM)
     model.train() 
@@ -74,12 +76,16 @@ def main():
     
     TEMP_ONNX = "temp_learner_export.onnx"
     training_step = 0
+    metrics_file = None
+    if os.getenv("AFL_LEARNER_METRICS"):
+        metrics_file = open(os.environ["AFL_LEARNER_METRICS"], "w", buffering=1)
+        metrics_file.write("unix_time,step,samples,positives,loss\n")
 
     # === [修改点 2] 批量训练配置 ===
     # 现在这里的 STEP 指的是 "Batch Step"
     # 500 个 Batch * 64 条数据 = 32,000 条数据
     # 这样的预热量比之前更有意义，模型会更稳定
-    WARMUP_STEPS = 500  
+    WARMUP_STEPS = int(os.getenv('AFL_LEARNER_WARMUP_STEPS', '500'))
     BATCH_SIZE = 64     # 每次处理 64 条数据 (根据你的 top 截图，内存完全够用)
     
     last_export_time = time.time()
@@ -142,6 +148,8 @@ def main():
             optimizer.step()
             
             training_step += 1
+            if metrics_file:
+                metrics_file.write(f"{time.time()},{training_step},{len(batch_features)},{sum(x[0] for x in batch_labels)},{loss.item()}\n")
             
             # --- 下面的逻辑基本保持不变，只是基于 step 的判断 ---
 
@@ -151,10 +159,10 @@ def main():
                     print(f"[Learner] Warming up... Batch {training_step}/{WARMUP_STEPS}. Loss={loss.item():.4f}")
 
             # 情况 B：预热结束，且达到导出间隔
-            elif time.time() - last_export_time > 60:
+            elif time.time() - last_export_time > float(os.getenv('AFL_MODEL_EXPORT_SECONDS', '60')):
                 # print(f"[Learner] Time {time.time()}: Loss={loss.item():.4f}. Exporting model...")
                 
-                model.eval()
+                model.train(not bool(os.getenv("AFL_NO_MC_DROPOUT")))
                 # 导出时只需要一个 dummy 输入即可，batch size 可以是 1
                 dummy_input = torch.randn(1, INPUT_DIM, dtype=torch.float32)
                 
@@ -164,6 +172,8 @@ def main():
                         dummy_input,
                         TEMP_ONNX,
                         export_params=True,
+                        training=(torch.onnx.TrainingMode.EVAL if os.getenv("AFL_NO_MC_DROPOUT") else torch.onnx.TrainingMode.TRAINING),
+                        dynamo=False,
                         opset_version=18, 
                         do_constant_folding=False,
                         input_names=['input'],
@@ -181,8 +191,7 @@ def main():
                         
                         final_bytes = onnx_model.SerializeToString()
                         
-                        r.set('global_model_main', final_bytes)
-                        r.set('global_model_version', str(time.time()))
+                        r.mset({'global_model_main': final_bytes, 'global_model_version': str(training_step)})
                         # print("[Learner] Model saved to Redis successfully.")
                         
                     else:

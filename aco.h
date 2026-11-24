@@ -44,6 +44,7 @@ enum {
 
 /* 初始化 ACO 矩阵 */
 void ACO_init(void);
+void ACO_ResetSequence(void);
 
 /* 选择下一个算子 */
 u32 ACO_SelectOperator(u32 prev_op);
