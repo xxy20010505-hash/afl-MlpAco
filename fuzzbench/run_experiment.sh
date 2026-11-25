@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd /home/xxy25/fuzzbench
-exec .venv/bin/python3 experiment/run_experiment.py \
+exec .venv/bin/python3 -m experiment.run_experiment \
   --experiment-config experiment-config/mlpaco-throughput-probe.yaml \
   --experiment-name "mlpaco-probe-$(date +%y%m%d-%H%M%S)" \
   --benchmarks libpng_libpng_read_fuzzer \
