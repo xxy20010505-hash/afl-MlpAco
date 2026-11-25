@@ -10,7 +10,7 @@
 - `afl_mlpaco_revision_probe_persistent`：AFL_revision，带独立 hook。
 - 每个目标、每个 fuzzer 一轮 12h：`max_total_time: 43200`、`trials: 1`。
 - FuzzBench 快照与 hook 周期采样均 60 秒。
-- runner 总并发 1，构建并发 1。两个 fuzzer 顺序运行，不并发。
+- runner 池 2 核、每个容器 1 核，允许两个 fuzzer 同时运行；构建并发仍为 1。
 - 示例目标为 `libpng_libpng_read_fuzzer`；其他目标通过启动脚本 `--benchmarks` 添加。
 - `experiment.yaml` 只含 FuzzBench 校验器接受的字段；fuzzer、目标和并发由
   `run_experiment.sh` 的官方 CLI 参数指定。安装配置不会启动实验。

@@ -6,5 +6,5 @@ exec .venv/bin/python3 experiment/run_experiment.py \
   --experiment-name "mlpaco-probe-$(date +%y%m%d-%H%M%S)" \
   --benchmarks libpng_libpng_read_fuzzer \
   --fuzzers afl_mlpaco_probe_persistent afl_mlpaco_revision_probe_persistent \
-  --runners-cpus 1 --measurers-cpus 1 --concurrent-builds 1 \
+  --runners-cpus 2 --measurers-cpus 1 --concurrent-builds 1 \
   --allow-uncommitted-changes
