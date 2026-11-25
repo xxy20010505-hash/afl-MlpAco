@@ -15,7 +15,7 @@
 - `experiment.yaml` 只含 FuzzBench 校验器接受的字段；fuzzer、目标和并发由
   `run_experiment.sh` 的官方 CLI 参数指定。安装配置不会启动实验。
 
-Builder/Runner 从 GitHub 拉取相同的固定提交，不使用本地 fuzzer 源码。
+Builder/Runner 从 GitHub 官方 codeload 下载相同固定提交的源码归档（记录归档 SHA-256），不使用本地 fuzzer 源码。
 不嵌入主机代理地址或凭据，不绑定主机 CPU 编号，由 Docker/FuzzBench 分配 CPU。
 
 ## /out/results/ 输出

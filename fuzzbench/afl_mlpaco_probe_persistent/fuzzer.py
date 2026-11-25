@@ -76,7 +76,7 @@ def fuzz(input_corpus,output_corpus,target_binary):
     metrics=results/'micro';metrics.mkdir(exist_ok=True)
     identity=json.loads((out/'mlpaco_build_identity.json').read_text())
     if identity['variant']!=VARIANT:raise RuntimeError('Builder/runner variant mismatch')
-    runner_commit=subprocess.check_output(['git','-C','/afl','rev-parse','HEAD'],text=True).strip()
+    runner_commit=(Path('/afl/SOURCE_COMMIT').read_text().strip() if Path('/afl/SOURCE_COMMIT').exists() else subprocess.check_output(['git','-C','/afl','rev-parse','HEAD'],text=True).strip())
     if runner_commit!=identity['commit']:raise RuntimeError('Builder/runner source commit mismatch')
     os.environ.update(AFL_NO_UI='1',AFL_SKIP_CPUFREQ='1',AFL_NO_AFFINITY='1',
         AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES='1',AFL_SKIP_CRASHES='1',AFL_SHUFFLE_QUEUE='1',
