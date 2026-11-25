@@ -68,7 +68,7 @@ def command_for(input_corpus,output_corpus,target_binary):
     dictionary=utils.get_dictionary_path(target_binary)
     if dictionary:command+=['-x',dictionary]
     command+=['--',target_binary]
-    command+=['@@'] if TARGET_MODE=='legacy_files' else ['2147483647']
+    command+=['2147483647']
     return command
 
 def fuzz(input_corpus,output_corpus,target_binary):
