@@ -38,7 +38,7 @@ def read_stats(path):
 def stats_syncer(source,results,stop):
     # Fixed columns and csv quoting prevent commas in command_line from shifting fields.
     results=Path(results)
-    with (results/'official_stats_10s.csv').open('w',newline='',buffering=1) as all_file, \
+    with (results/'official_stats_60s.csv').open('w',newline='',buffering=1) as all_file, \
          (results/'fuzzer_stats_history.csv').open('w',newline='',buffering=1) as history:
         writer=csv.DictWriter(all_file,fieldnames=FIELDS,extrasaction='ignore')
         minute=csv.DictWriter(history,fieldnames=FIELDS,extrasaction='ignore')
@@ -59,7 +59,7 @@ def stats_syncer(source,results,stop):
                 minute.writerow(row);last_history=time.monotonic()
         while not stop.is_set():
             sample()
-            stop.wait(10)
+            stop.wait(60)
         sample()
 
 def command_for(input_corpus,output_corpus,target_binary):

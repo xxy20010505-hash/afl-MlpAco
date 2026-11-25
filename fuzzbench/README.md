@@ -1,78 +1,46 @@
 # FuzzBench throughput probe
 
-This branch contains instrumented **legacy AFL-MLPACO** (`diagnostics/AFL`) and
-**AFL_revision** (`diagnostics/AFL_revision`). The root implementation is revision.
-No host CPU IDs are forced: FuzzBench/Docker controls the CPU quota, including the
-learner and loader. Production defaults retain 50000 execution/500 batch warmup.
+当前只使用官方 AFL driver 启动形式：`-- target_binary 2147483647`，不传 `@@`。
+旧适配器的 `@@` 会使提供的 driver 走文件执行分支，绕过 persistent 循环；
+本分支改用官方方式。旧分支提交保留历史，不再安装旧启动配置。
 
-## Four isolated integrations
+## 配置
 
-Copy the four `*_probe_*` directories into the FuzzBench checkout's `fuzzers/`.
-Each builder and runner downloads this GitHub repository, pinned by `MLPACO_REF`.
-They do not build a fuzzer from a host-local source checkout.
+- `afl_mlpaco_probe_persistent`：旧改进版 AFL，带独立 hook。
+- `afl_mlpaco_revision_probe_persistent`：AFL_revision，带独立 hook。
+- 每个目标、每个 fuzzer 一轮 12h：`max_total_time: 43200`、`trials: 1`。
+- FuzzBench 快照与 hook 周期采样均 60 秒。
+- runner 总并发 1，构建并发 1。两个 fuzzer 顺序运行，不并发。
+- 示例目标为 `libpng_libpng_read_fuzzer`；其他目标通过启动脚本 `--benchmarks` 添加。
+- `experiment.yaml` 只含 FuzzBench 校验器接受的字段；fuzzer、目标和并发由
+  `run_experiment.sh` 的官方 CLI 参数指定。安装配置不会启动实验。
 
-| Configuration | Algorithm | Target arguments |
-| --- | --- | --- |
-| afl_mlpaco_probe_legacy_files | legacy | `@@`, matching supplied old adapter |
-| afl_mlpaco_probe_persistent | legacy | `2147483647`, matching upstream AFL adapter |
-| afl_mlpaco_revision_probe_legacy_files | revision | `@@` |
-| afl_mlpaco_revision_probe_persistent | revision | `2147483647` |
+Builder/Runner 从 GitHub 拉取相同的固定提交，不使用本地 fuzzer 源码。
+不嵌入主机代理地址或凭据，不绑定主机 CPU 编号，由 Docker/FuzzBench 分配 CPU。
 
-All four retain `-t 2000+`, `-d`, dictionary lookup, initial queue shuffling and the
-same provided `afl_driver.cpp`. Thus the mode pair changes only the driver arguments.
-The supplied driver processes argv files with `ExecuteFilesOnyByOne` when passed
-`@@`; this bypasses its persistent loop even though the binary contains persistent
-and deferred forkserver signatures. The numeric argument selects persistent mode.
-This is a hypothesis to test, not proof that this alone caused the old libpng gap.
+## /out/results/ 输出
 
-The example `experiment.yaml` adds upstream `afl` as a baseline, uses libpng,
-12 hours, 60-second snapshots, one trial. Upstream AFL uses its own timeout/build
-settings; use the matched two-mode pairs to isolate the driver argument change.
-No experiment is started by installing these files.
+- `fuzzer_stats_history.csv` / `official_stats_60s.csv`：固定 CSV 列，按60秒读取
+  AFL 原生 `execs_per_sec`，保留 `last_update`；原文件未刷新时可能重复。
+- `micro/native_speed.csv`：fuzzer 内 hook 每60秒捕获实时平滑 `avg_exec`，
+  即原生 `execs_per_sec` 的计算值；同时独立记录计数差分吞吐、单调时钟、
+  max_depth、paths_total、跳过数和可取得的 CPU 累计时间。不是全程平均速度。
+- `micro/stats_write.csv`：每次原生状态文件写入时记录其确切 eps 参数，
+  可与对应 `fuzzer_stats` / CSV 转录值核对。这是写入事件日志，不额外触发写状态。
+- `micro/runtime.csv`：每60秒的独立累计执行次数与单调时钟，用于差分验证。
+- `micro/timing-*.csv`：每60秒累计组件计时；ACO 按1/64计时、每次调用计数。
+  不可重复相加累计行或父子嵌套项，也不能把后台时间当作主线程阻塞时间。
+- `micro/learner_timing.csv`：每60秒训练、导出和 Redis 累计耗时。
+- `micro/training_steps.csv`：每60秒聚合该窗口更新次数、实际样本数、正例数、
+  BCE loss 均值/最小值/最大值，更新数量完整计数，但不逐 batch 写磁盘。
+- `micro/nn_summary.csv`：revision 正常退出时的累计 MC 汇总。
+- `cgroup_samples.jsonl`：每60秒采集可用的 CPU 使用/限流计数。
+- `probe_manifest.json`：源码提交、二进制哈希、目标参数、CPU配额和亲和性。
+- actor/learner/Redis 日志与 probe_end.json：检查真实运行及退出情况。
 
-## Persistent diagnostics under `/out/results/`
+启动与正常退出允许额外的边界快照。hook 不按每次 target 执行打印日志；
+函数耗时累计在内存中，周期写盘。计时 hook 并非免费，比较时保持配置一致。
 
-- `fuzzer_stats_history.csv`: fixed-column 60-second transcription of the AFL
-  native status file; commas in command lines are quoted correctly.
-- `official_stats_10s.csv`: the same status file sampled every 10 seconds, including
-  its native `last_update` and `stats_available`. Repeated values are expected
-  because native AFL usually rewrites this file every 60 seconds.
-- `micro/native_speed.csv`: independent hook in `show_stats`, roughly every
-  10 seconds, captures the live smoothed `avg_exec` used for native execs/sec,
-  not lifetime-average throughput. Also records count-difference throughput,
-  monotonic nanoseconds, max_depth, queue size and skip count.
-- `micro/stats_write.csv`: captures the exact eps argument **after** native
-  write_stats_file's fallback logic, so its rounded value can be matched directly
-  to fuzzer_stats and the history CSV. This occurs at each native status write.
-- `micro/runtime.csv`: independent execution-count snapshots using a monotonic
-  clock. Wall-clock time is for labels, not throughput denominators.
-- `micro/timing-*.csv`: cumulative per-thread component counters and timings;
-  ACO is timed at 1/64 calls, with full call counts. Do not sum cumulative rows,
-  inclusive parent/child scopes or main/background totals as blocking time.
-- `micro/learner_timing.csv`, `micro/training_steps.csv`: training/export/Redis
-  timings and actual samples, positives, BCE loss for each update.
-- `micro/nn_summary.csv`: revision's cumulative MC summary at graceful exit.
-- `cgroup_samples.jsonl`: CPU usage/throttling counters where available.
-- `probe_manifest.json`: exact command, target/fuzzer hashes, source commit,
-  target mode and available CPU quota/affinity. actor.log, learner.log and redis.log
-  retain failures rather than swallowing them or silently disabling the fuzzer.
-
-The hook writes small records at low frequency; it does not print every target
-execution and adds no Python code to the target. Component timing is additional
-instrumentation and is not free. Compare identical hook settings across groups.
-
-## Interpretation
-
-1. Compare stats_write's native speed with the status/history value at its matching
-   last_update. A mismatch indicates transcription/parsing rather than throughput.
-2. Compare native_speed and execution-count differences over their own recorded
-   monotonic windows. Smoothed and interval speeds have different semantics.
-3. Compare legacy_files versus persistent for the same algorithm/target/seed setup.
-4. Inspect cgroup throttling and learner activity. Unlike the earlier WSL test,
-   FuzzBench may charge learner and actor to one shared CPU quota.
-
-Code assumes Linux x86-64 and the supplied FuzzBench focal base images. Builder
-and runner use the same source ref and ONNX C runtime. Proxy addresses, credentials
-and host CPU pinning are deliberately not embedded; configure normal Docker build
-proxy arguments externally if needed. The Python ONNX package is used for export;
-the actor links the bundled ONNX Runtime C library, not the pip runtime package.
+核对顺序：先将 stats_write 与官方原生字段对齐，再比较 native_speed 与单调
+时钟差分；随后检查目标模式、模型活动、CPU限流与组件耗时。
+本地 WSL 的独立CPU实验和 FuzzBench 共享单核配额不同，不能直接归因为算法。

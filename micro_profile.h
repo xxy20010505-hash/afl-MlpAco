@@ -61,7 +61,7 @@ void mb_leave(mb_scope *s){if(!s->active)return;uint64_t end=mb_now(),dt=end-s->
  mb_stat *a=&mb_tls.stats[s->id];a->n++;a->ns+=dt;a->self+=dt>s->child?dt-s->child:0;if(dt>a->max)a->max=dt;
  unsigned bin=dt?63-__builtin_clzll(dt):0;if(bin>31)bin=31;a->bins[bin]++;
  if(mb_tls.depth)mb_tls.depth--;if(mb_tls.depth)mb_tls.stack[mb_tls.depth-1]->child+=dt;
- if(end-mb_tls.last>=10000000000ULL)mb_flush();}
+ if(end-mb_tls.last>=60000000000ULL)mb_flush();}
 void mb_seed(int selected,double cost,double len,double depth,double bitmap){mb_init();if(!mb_tls.enabled)return;
  mb_stat *a=&mb_tls.stats[selected?MB_SELECTED:MB_REJECTED];a->calls++;a->cost+=cost;a->len+=len;a->depth+=depth;a->bitmap+=bitmap;}
 #endif

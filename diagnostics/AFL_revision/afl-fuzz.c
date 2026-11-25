@@ -358,7 +358,7 @@ static void probe_speed(const char *kind, double native_eps, int force) {
   static FILE *live=NULL,*official=NULL;
   static unsigned long long last_ns=0,last_execs=0;
   unsigned long long now=mb_now();
-  if(!force && last_ns && now-last_ns<10000000000ULL)return;
+  if(!force && last_ns && now-last_ns<60000000000ULL)return;
   FILE **slot=force?&official:&live;
   if(!*slot){char path[4096];snprintf(path,sizeof(path),"%s/%s.csv",dir,kind);*slot=fopen(path,"w");if(!*slot){perror(path);exit(1);}fprintf(*slot,"unix_time,monotonic_ns,execs_done,native_execs_per_sec,interval_execs_per_sec,max_depth,paths_total,total_skipped,self_cpu_us,children_cpu_us\n");}
   struct timespec t;clock_gettime(CLOCK_REALTIME,&t);
