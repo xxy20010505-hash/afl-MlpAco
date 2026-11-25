@@ -1,6 +1,6 @@
 ARG parent_image
 FROM $parent_image
-ARG MLPACO_REF=d071369b930a7c4d0077c7f51e0418c67a469e47
+ARG MLPACO_REF=3c92a0ae3953120a7e89c834193873f3066563c8
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates make libhiredis-dev clang-12 llvm-12 llvm-12-dev libc++-12-dev libc++abi-12-dev zlib1g-dev && rm -rf /var/lib/apt/lists/*
 RUN git init /afl && cd /afl && git remote add origin https://github.com/xxy20010505-hash/afl-MlpAco.git && git fetch --depth 1 origin ${MLPACO_REF} && git checkout --detach FETCH_HEAD
 WORKDIR /afl
