@@ -1,8 +1,8 @@
 ARG parent_image
 FROM $parent_image
 ARG MLPACO_REF=3c92a0ae3953120a7e89c834193873f3066563c8
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates make libhiredis-dev clang-12 llvm-12 llvm-12-dev libc++-12-dev libc++abi-12-dev zlib1g-dev && rm -rf /var/lib/apt/lists/*
-RUN git init /afl && cd /afl && git remote add origin https://github.com/xxy20010505-hash/afl-MlpAco.git && for attempt in 1 2 3; do git -c http.version=HTTP/1.1 -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 fetch --depth 1 origin ${MLPACO_REF} && break; sleep 2; done && git checkout --detach FETCH_HEAD
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; apt-get -o Acquire::Retries=3 update && apt-get -o Acquire::Retries=3 install -y --no-install-recommends git ca-certificates make libhiredis-dev clang-12 llvm-12 llvm-12-dev libc++-12-dev libc++abi-12-dev zlib1g-dev && rm -rf /var/lib/apt/lists/*
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; git init /afl && cd /afl && git remote add origin https://github.com/xxy20010505-hash/afl-MlpAco.git && for attempt in 1 2 3; do git -c http.version=HTTP/1.1 -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 fetch --depth 1 origin ${MLPACO_REF} && break; sleep 2; done && git checkout --detach FETCH_HEAD
 WORKDIR /afl
 ENV LD_LIBRARY_PATH=/afl/onnxruntime/lib
 RUN cp diagnostics/AFL_revision/* . && AFL_NO_X86=1 make CC=clang-12 CXX=clang++-12 afl-fuzz afl-showmap && python3 diagnostics/write_build_identity.py AFL_revision
