@@ -21,7 +21,7 @@ BIN_PATH    = $(PREFIX)/bin
 HELPER_PATH = $(PREFIX)/lib/afl
 DOC_PATH    = $(PREFIX)/share/doc/afl
 MISC_PATH   = $(PREFIX)/share/afl
-ONNX_PATH   = $(HOME)/桌面/onnxruntime
+ONNX_PATH   ?= $(CURDIR)/onnxruntime
 
 # PROGS intentionally omit afl-as, which gets installed elsewhere.
 
@@ -36,7 +36,7 @@ CFLAGS     += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
 
 ifneq "$(filter Linux GNU%,$(shell uname))" ""
   LDFLAGS  += -ldl \
-              -L$(ONNX_PATH)/lib -lhiredis -lonnxruntime -lm
+              -L$(ONNX_PATH)/lib -lhiredis -lonnxruntime -lm -pthread
 endif
 
 ifeq "$(findstring clang, $(shell $(CC) --version 2>/dev/null))" ""
@@ -72,7 +72,7 @@ afl-as: afl-as.c afl-as.h $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
 	ln -sf afl-as as
 
-afl-fuzz: afl-fuzz.c $(COMM_HDR) | test_x86
+afl-fuzz: afl-fuzz.c aco.c aco.h $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) aco.c afl-fuzz.c -o $@ $(LDFLAGS)
 
 afl-showmap: afl-showmap.c $(COMM_HDR) | test_x86

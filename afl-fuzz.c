@@ -37,6 +37,8 @@
 #endif
 #define _FILE_OFFSET_BITS 64
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <hiredis/hiredis.h>
 #include <onnxruntime_c_api.h>
 #include <math.h>
@@ -116,6 +118,7 @@ EXP_ST u32 cpu_to_bind = 0;           /* id of free CPU core to bind      */
 
 static u32 stats_update_freq = 1;     /* Stats update frequency (execs)   */
 
+static u8 aco_execution_reward;
 EXP_ST u64 total_skipped_paths = 0; /* Total number of skipped inputs by MLP */
 
 EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
@@ -345,6 +348,25 @@ enum {
 };
 
 
+#define MICRO_PROFILE_IMPL
+#define MICRO_PROFILE_RUNTIME
+#include "micro_profile.h"
+
+/* Independent low-frequency throughput measurement; no target-process hooks. */
+static void probe_speed(const char *kind, double native_eps, int force) {
+  const char *dir=getenv("AFL_MICRO_DIR"); if(!dir)return;
+  static FILE *live=NULL,*official=NULL;
+  static unsigned long long last_ns=0,last_execs=0;
+  unsigned long long now=mb_now();
+  if(!force && last_ns && now-last_ns<10000000000ULL)return;
+  FILE **slot=force?&official:&live;
+  if(!*slot){char path[4096];snprintf(path,sizeof(path),"%s/%s.csv",dir,kind);*slot=fopen(path,"w");if(!*slot){perror(path);exit(1);}fprintf(*slot,"unix_time,monotonic_ns,execs_done,native_execs_per_sec,interval_execs_per_sec,max_depth,paths_total,total_skipped,self_cpu_us,children_cpu_us\n");}
+  struct timespec t;clock_gettime(CLOCK_REALTIME,&t);
+  struct rusage self,children;getrusage(RUSAGE_SELF,&self);getrusage(RUSAGE_CHILDREN,&children);
+  double eps=last_ns?(total_execs-last_execs)*1e9/(now-last_ns):0;
+  fprintf(*slot,"%.6f,%llu,%llu,%.8f,%.8f,%u,%u,%llu,%llu,%llu\n",t.tv_sec+t.tv_nsec/1e9,now,(unsigned long long)total_execs,native_eps,eps,max_depth,queued_paths,(unsigned long long)total_skipped_paths,(unsigned long long)(self.ru_utime.tv_sec+self.ru_stime.tv_sec)*1000000+self.ru_utime.tv_usec+self.ru_stime.tv_usec,(unsigned long long)(children.ru_utime.tv_sec+children.ru_stime.tv_sec)*1000000+children.ru_utime.tv_usec+children.ru_stime.tv_usec);fflush(*slot);
+  if(!force){last_ns=now;last_execs=total_execs;}
+}
 /* Get unix time in milliseconds */
 
 static u64 get_cur_time(void) {
@@ -362,14 +384,9 @@ static u64 get_cur_time(void) {
 /* Get unix time in microseconds */
 
 static u64 get_cur_time_us(void) {
-
-  struct timeval tv;
-  struct timezone tz;
-
-  gettimeofday(&tv, &tz);
-
-  return (tv.tv_sec * 1000000ULL) + tv.tv_usec;
-
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts)) { perror("clock_gettime"); exit(1); }
+  return (u64)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
 }
 
 
@@ -2299,6 +2316,7 @@ EXP_ST void init_forkserver(char** argv) {
    information. The called program will update trace_bits[]. */
 
 static u8 run_target(char** argv, u32 timeout) {
+  MB_SCOPE(MB_TARGET);
 
   static struct itimerval it;
   static u32 prev_timed_out = 0;
@@ -3199,6 +3217,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
 #endif /* ^!SIMPLE_FILES */
 
+    if (hnb > aco_execution_reward) aco_execution_reward = hnb;
     add_to_queue(fn, len, 0);
 
     if (hnb == 2) {
@@ -3461,6 +3480,7 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
     last_eps  = eps;
   }
 
+  probe_speed("stats_write",eps,1);
   fprintf(f, "start_time        : %llu\n"
              "last_update       : %llu\n"
              "fuzzer_pid        : %u\n"
@@ -3988,6 +4008,7 @@ static void show_stats(void) {
 
   last_ms = cur_ms;
   last_execs = total_execs;
+  probe_speed("native_speed",avg_exec,0);
 
   /* Tell the callers when to contact us (as measured in execs). */
 
@@ -4756,35 +4777,42 @@ static u32 choose_block_len(u32 limit) {
 /* ========================================================================= */
 
 /* --- 全局变量定义 --- */
-static redisContext *redis_ctx = NULL;
-static u8 redis_connected = 0;
+static _Thread_local redisContext *redis_ctx = NULL;
+static _Thread_local u8 redis_connected = 0;
 
 static const OrtApi* g_ort = NULL;
 static OrtEnv* ort_env = NULL;
 static OrtSession* ort_session = NULL;
+static _Atomic(OrtSession*) pending_session;
+static _Atomic(OrtSession*) retired_session;
+static atomic_int loader_stop;
+static pthread_t loader_thread;
+static int loader_started;
+
 static OrtSessionOptions* ort_session_options = NULL;
 static OrtMemoryInfo* ort_memory_info = NULL;
 
 #define INPUT_DIM 6  /* 必须与 Python 端一致 */
-static char* last_model_version = NULL;
+static _Thread_local char* last_model_version = NULL;
 static u8 use_nn_scheduling = 1;
 static u8 use_aco_mutation = 1;
 static pid_t learner_pid = 0;
 
 #define DET_EXEC_LIMIT    20000  // 确定性变异次数
 #define WARMUP_THRESHOLD  50000  // 前 50,000 次执行为预热期 (约 30-60秒)
-#define SYNC_INTERVAL     1000   // 预热后，每 1,000 次才检查一次模型 (降低频率)
+#define NN_UNUSED_SYNC_INTERVAL 1000   // 预热后，每 1,000 次才检查一次模型 (降低频率)
 #define OVERUSE_THRESHOLD 50.0f  // 种子fuzz次数阈值
 
 /* --- 1. 初始化 Redis --- */
 static void init_redis(void) {
   struct timeval timeout = { 1, 500000 }; /* 1.5秒超时 */
-  redis_ctx = redisConnectWithTimeout("127.0.0.1", 6379, timeout);
+  redis_ctx = redisConnectWithTimeout("127.0.0.1", (getenv("AFL_REDIS_PORT") ? atoi(getenv("AFL_REDIS_PORT")) : 6379), timeout);
   
   if (redis_ctx == NULL || redis_ctx->err) {
     if (redis_ctx) {
       WARNF("Connection error: %s\n", redis_ctx->errstr);
       redisFree(redis_ctx);
+      redis_ctx = NULL;
     } else {
       WARNF("Connection error: can't allocate redis context\n");
     }
@@ -4817,7 +4845,7 @@ static void spawn_learner_process(void) {
     // 1. 【持久化关键】重定向到 /out 目录
     // =========================================================
     // FuzzBench 挂载卷在 /out，写在这里的文件即使容器删了也会留在宿主机硬盘上
-    int log_fd = open("/out/python_learner.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    int log_fd = open(getenv("AFL_LEARNER_LOG"), O_WRONLY | O_CREAT | O_APPEND, 0666);
     
     if (log_fd >= 0) {
         // 重定向标准输出 (print)
@@ -4846,7 +4874,7 @@ static void spawn_learner_process(void) {
     
     // 请确认你的 Dockerfile 里确实把 learner_onnx.py 放到了 /afl/ 目录下
     // 如果是用 FuzzBench 标准 COPY，通常也在 /out/ 下，请核实路径！
-    char* args[] = {"python3", "-u", "/afl/learner_onnx.py", NULL};
+    char* args[] = {"python3", "-u", getenv("AFL_LEARNER_SCRIPT") ? getenv("AFL_LEARNER_SCRIPT") : "/afl/learner_onnx.py", NULL};
 
     // 3. 执行
     execvp("python3", args);
@@ -4897,13 +4925,14 @@ static void init_onnx_env(void) {
 
 /* --- 4. 模型同步 (内存热替换) --- */
 static void sync_nn_model(void) {
+  MB_SCOPE(MB_SYNC);
   if (!redis_connected || !redis_ctx || !g_ort) {
     WARNF("[Sync] Aborted: redis wrong");
     return;
   }
   
   /* 1. 获取版本号 */
-  redisReply *reply_ver = redisCommand(redis_ctx, "GET global_model_version");
+  redisReply *reply_ver = MB_EXPR(MB_REDIS_VERSION, redisCommand(redis_ctx, "GET global_model_version"));
   
   if (!reply_ver) { 
       WARNF("[Sync] Redis command failed (NULL reply). Connection lost?");
@@ -4937,8 +4966,8 @@ static void sync_nn_model(void) {
   /* === 版本变了，开始更新 === */
   ACTF("[Sync] Fetching new NN model... (New Version: %s)", reply_ver->str);
 
-  redisReply *reply_model = redisCommand(redis_ctx, "GET global_model_main");
-  if (!reply_model || reply_model->type != REDIS_REPLY_STRING) {
+  redisReply *reply_model = MB_EXPR(MB_REDIS_MODEL, redisCommand(redis_ctx, "MGET global_model_main global_model_version"));
+  if (!reply_model || reply_model->type != REDIS_REPLY_ARRAY || reply_model->elements != 2 || reply_model->element[0]->type != REDIS_REPLY_STRING || reply_model->element[1]->type != REDIS_REPLY_STRING) {
     WARNF("[Sync] Failed to fetch model body or invalid type.");
     freeReplyObject(reply_ver); 
     if(reply_model) freeReplyObject(reply_model); 
@@ -4947,19 +4976,39 @@ static void sync_nn_model(void) {
 
   /* 加载 Session */
   OrtSession* new_session = NULL;
-  OrtStatus* status = g_ort->CreateSessionFromArray(ort_env, reply_model->str, reply_model->len, ort_session_options, &new_session);
+  OrtStatus* status = MB_EXPR(MB_LOAD, g_ort->CreateSessionFromArray(ort_env, reply_model->element[0]->str, reply_model->element[0]->len, ort_session_options, &new_session));
 
+  if (status == NULL) {
+    /* Validate the candidate with the exact input contract before publication. */
+    float probe[INPUT_DIM] = {0};
+    int64_t shape[2] = {1, INPUT_DIM};
+    OrtValue *in = NULL, *out = NULL;
+    const char *ins[] = {"input"}, *outs[] = {"output"};
+    status = g_ort->CreateTensorWithDataAsOrtValue(ort_memory_info, probe,
+      sizeof(probe), shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in);
+    if (!status) status = MB_EXPR(MB_ORT_RUN, g_ort->Run(new_session, NULL, ins,
+      (const OrtValue* const*)&in, 1, outs, 1, &out));
+    if (in) g_ort->ReleaseValue(in);
+    if (out) g_ort->ReleaseValue(out);
+    if (status) { MB_VOID(MB_RELEASE, g_ort->ReleaseSession(new_session)); new_session = NULL; }
+  }
   if (status != NULL) {
     const char* msg = g_ort->GetErrorMessage(status);
     WARNF("[Sync] Model update failed: %s", msg);
     g_ort->ReleaseStatus(status);
   } else {
     /* 替换成功 */
-    if (ort_session) g_ort->ReleaseSession(ort_session);
-    ort_session = new_session;
+    if (!getenv("AFL_SYNC_MODEL") && !no_forkserver && !dumb_mode) {
+      OrtSession* stale = atomic_exchange(&pending_session, new_session);
+      if (stale) MB_VOID(MB_RELEASE, g_ort->ReleaseSession(stale));
+    } else {
+      if (ort_session) MB_VOID(MB_RELEASE, g_ort->ReleaseSession(ort_session));
+      ort_session = new_session;
+    }
     
+    mb_tls.stats[MB_MODEL_READY].calls++;
     if (last_model_version) ck_free(last_model_version);
-    last_model_version = ck_strdup(reply_ver->str);
+    last_model_version = ck_strdup(reply_model->element[1]->str);
     
     OKF("[Sync] SUCCESS! Model updated to Version: %s", reply_ver->str);
   }
@@ -4968,8 +5017,53 @@ static void sync_nn_model(void) {
   freeReplyObject(reply_model);
 }
 
+static void* model_loader(void* unused) { /* FuzzBench controls CPU quota/affinity; do not force host CPU IDs. */
+  struct timeval timeout = {1, 0};
+  redis_ctx = redisConnectWithTimeout("127.0.0.1", (getenv("AFL_REDIS_PORT") ? atoi(getenv("AFL_REDIS_PORT")) : 6379), timeout);
+  redis_connected = redis_ctx && !redis_ctx->err;
+  if (redis_connected) redisSetTimeout(redis_ctx, timeout);
+  unsigned ticks = 0;
+  while (!atomic_load(&loader_stop)) {
+    OrtSession* old = atomic_exchange(&retired_session, NULL);
+    if (old) MB_VOID(MB_RELEASE, g_ort->ReleaseSession(old));
+    if (!(ticks++ % (getenv("AFL_MODEL_CHECK_MS") ? (unsigned)fmax(1, strtoul(getenv("AFL_MODEL_CHECK_MS"),NULL,10)/100) : 300))) {
+      if (!redis_connected) {
+        if (redis_ctx) redisFree(redis_ctx);
+        redis_ctx = redisConnectWithTimeout("127.0.0.1",
+          getenv("AFL_REDIS_PORT") ? atoi(getenv("AFL_REDIS_PORT")) : 6379, timeout);
+        redis_connected = redis_ctx && !redis_ctx->err;
+        if (redis_connected) redisSetTimeout(redis_ctx, timeout);
+      }
+      sync_nn_model();
+    }
+    usleep(100000);
+  }
+  if (redis_ctx) redisFree(redis_ctx);
+  if (last_model_version) ck_free(last_model_version);
+  return NULL;
+}
+static void poll_model(void) {
+  /* Start only after the target forkserver exists. No-forkserver stays synchronous. */
+  if (getenv("AFL_SYNC_MODEL") || no_forkserver || dumb_mode) {
+    sync_nn_model(); return;
+  }
+  if (!loader_started && forksrv_pid > 0)
+    loader_started = pthread_create(&loader_thread, NULL, model_loader, NULL) == 0;
+}
+static void adopt_model(void) {
+  MB_SCOPE(MB_ADOPT);
+  if (atomic_load(&retired_session)) return;
+  OrtSession* next = atomic_exchange(&pending_session, NULL);
+  if (next) {
+    OrtSession* old = ort_session; ort_session = next; mb_tls.stats[MB_MODEL_ADOPTED].calls++;
+    OKF("[Async] Candidate model adopted at seed boundary.");
+    atomic_store(&retired_session, old);
+  }
+}
+
 /* --- 5. 推理函数 (计算种子选择概率) --- */
-static float predict_probability(float* features) {
+static float predict_once(float* features) {
+  MB_SCOPE(MB_FORWARD);
   if (!ort_session || !g_ort) return -1.0f;
   
   OrtValue* input_tensor = NULL;
@@ -4986,7 +5080,7 @@ static float predict_probability(float* features) {
   const char* output_names[] = {"output"};
   
   /* 执行推理 */
-  if (g_ort->Run(ort_session, NULL, input_names, (const OrtValue* const*)&input_tensor, 1, output_names, 1, &output_tensor) != NULL) {
+  if (MB_EXPR(MB_ORT_RUN, g_ort->Run(ort_session, NULL, input_names, (const OrtValue* const*)&input_tensor, 1, output_names, 1, &output_tensor)) != NULL) {
       g_ort->ReleaseValue(input_tensor);
       return -1.0f;
   }
@@ -5009,8 +5103,37 @@ static float predict_probability(float* features) {
   return result;
 }
 
+static u64 nn_decision_count, nn_forward_count, nn_error_count, nn_elapsed_us;
+static double nn_mean_sum, nn_std_sum, nn_score_sum;
+static float predict_probability(float* features) {
+  MB_SCOPE(MB_INFER);
+  u64 inference_start = get_cur_time_us();
+  nn_decision_count++;
+
+  int n = getenv("AFL_MC_SAMPLES") ? atoi(getenv("AFL_MC_SAMPLES")) : 8;
+  if (getenv("AFL_NO_MC_DROPOUT")) n = 1;
+  if (n < 1) n = 1;
+  if (n > 64) n = 64;
+  double sum = 0, sq = 0;
+  for (int i = 0; i < n; ++i) {
+    nn_forward_count++;
+    float v = predict_once(features);
+    if (v < 0) { nn_error_count++; return -1; }
+    sum += v; sq += v*v;
+  }
+  double mean = sum/n;
+  double variance = n > 1 ? (sq - sum*sum/n)/(n-1) : 0;
+  double lambda = getenv("AFL_MC_LAMBDA") ? atof(getenv("AFL_MC_LAMBDA")) : 1.0;
+  double score = mean + lambda * sqrt(fmax(0, variance));
+  score = fmin(1, fmax(0, score));
+  nn_mean_sum += mean; nn_std_sum += sqrt(fmax(0, variance)); nn_score_sum += score;
+  nn_elapsed_us += get_cur_time_us() - inference_start;
+  return score;
+}
+
 /* --- 6. 发送反馈 (Training Data) --- */
 static void send_feedback(struct queue_entry* q, u8 found_new_path) {
+  MB_SCOPE(MB_FEEDBACK);
   if (!redis_connected || !redis_ctx) return;
   
   float f[INPUT_DIM];
@@ -5041,15 +5164,16 @@ static void send_feedback(struct queue_entry* q, u8 found_new_path) {
   char buf[256];
   snprintf(buf, sizeof(buf), "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f|%.2f", f[0], f[1], f[2], f[3], f[4], f[5] ,label);
   
-  redisReply *reply = redisCommand(redis_ctx, "RPUSH train_queue %s", buf);
+  redisReply *reply = MB_EXPR(MB_REDIS_FEEDBACK, redisCommand(redis_ctx, "RPUSH train_queue %s", buf));
   if (reply) freeReplyObject(reply);
 }
 
 /* --- 种子选择决策函数 --- */
 /* 返回 1 表示：选中该种子 (Fuzz)
    返回 0 表示：跳过该种子 (Skip) */
-static u8 neural_should_fuzz(struct queue_entry *q) {
+static u8 neural_should_fuzz_impl(struct queue_entry *q) {
     
+    adopt_model();
     /* 1. 同步模型逻辑 (从 calculate_score 移到这里) */
     static u32 sync_counter = 0;
     static u64 last_sync_time = 0;
@@ -5057,15 +5181,15 @@ static u8 neural_should_fuzz(struct queue_entry *q) {
     ++sync_counter;
 
     // 预热期：无条件选中，让 Learner 收集数据
-    if (total_execs < WARMUP_THRESHOLD) return 1;
+    if (total_execs < (getenv("AFL_NN_WARMUP_EXECS") ? strtoull(getenv("AFL_NN_WARMUP_EXECS"), NULL, 10) : WARMUP_THRESHOLD)) return 1;
 
     //确定性变异时间减少
     if (!skip_deterministic && total_execs > DET_EXEC_LIMIT) skip_deterministic = 1;;
 
     // 定期检查更新
-    if (use_nn_scheduling && (current_time - last_sync_time > 30000)) {
+    if (use_nn_scheduling && (current_time - last_sync_time > (getenv("AFL_MODEL_CHECK_MS") ? strtoull(getenv("AFL_MODEL_CHECK_MS"), NULL, 10) : 30000))) {
         ACTF("Triggering sync_nn_model check..."); // 可选日志
-        sync_nn_model();
+        poll_model();
         last_sync_time = current_time;
         ACTF("Syncing model at %llu ms", current_time); // 可选日志
     }
@@ -5117,6 +5241,13 @@ static u8 neural_should_fuzz(struct queue_entry *q) {
 /* ========================================================================= */
 /* CUSTOM ACTOR-LEARNER CODE END                                             */
 /* ========================================================================= */
+
+static u8 neural_should_fuzz(struct queue_entry *q) {
+  MB_SCOPE(MB_DECISION);
+  u8 result=neural_should_fuzz_impl(q);
+  mb_seed(result,q->exec_us,q->len,q->depth,q->bitmap_size);
+  return result;
+}
 
 /* Calculate case desirability score to adjust the length of havoc fuzzing.
    A helper function for fuzz_one(). Maybe some of these constants should
@@ -5380,6 +5511,7 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
    skipped or bailed out. */
 
 static u8 fuzz_one(char** argv) {
+  MB_SCOPE(MB_FUZZ);
 
   s32 len, fd, temp_len, i, j;
   u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
@@ -6522,6 +6654,10 @@ havoc_stage:
   }
 
   if (stage_max < HAVOC_MIN) stage_max = HAVOC_MIN;
+  if (getenv("AFL_HAVOC_STAGE_MAX")) {
+    u32 cap = strtoul(getenv("AFL_HAVOC_STAGE_MAX"), NULL, 10);
+    if (cap && stage_max > cap) stage_max = cap;
+  }
 
   temp_len = len;
 
@@ -6541,11 +6677,13 @@ havoc_stage:
     if (use_aco_mutation) {
       
       /* ACO: 重置本次 stacking 的状态 */
+      ACO_ResetSequence();
       aco_seq_len = 0;
       aco_prev_op = ACO_START_NODE;
 
       /* 记录当前路径数量，用于判断是否发现了新路径 (Reward Calculation) */
-      u64 saved_queued_paths = queued_paths;
+      aco_execution_reward = 0;
+      u64 saved_unique_crashes = unique_crashes;
 
       for (i = 0; i < use_stacking; i++) {
 
@@ -6677,10 +6815,9 @@ havoc_stage:
       if (common_fuzz_stuff(argv, out_buf, temp_len)) goto abandon_entry;
 
       /* ACO 反馈 */
-      u8 reward_level = 0;
-      if (queued_paths > saved_queued_paths) {
-          reward_level = 2;
-      }
+      u8 reward_level = aco_execution_reward;
+      if (unique_crashes > saved_unique_crashes) reward_level = 2;
+      if (getenv("AFL_NO_HIERARCHICAL") && reward_level) reward_level = 2;
       ACO_NotifyFeedback(aco_op_seq, aco_seq_len, reward_level);
 
     } else {
@@ -6823,6 +6960,10 @@ havoc_stage:
     if (queued_paths != havoc_queued) {
       if (perf_score <= HAVOC_MAX_MULT * 100) {
         stage_max  *= 2;
+        if (getenv("AFL_HAVOC_STAGE_MAX")) {
+          u32 cap = strtoul(getenv("AFL_HAVOC_STAGE_MAX"), NULL, 10);
+          if (cap && stage_max > cap) stage_max = cap;
+        }
         perf_score *= 2;
       }
       havoc_queued = queued_paths;
@@ -8538,8 +8679,22 @@ stop_fuzzing:
 
   /* ====== 退出清理 ====== */
   if (learner_pid > 0) kill(learner_pid, SIGTERM);
+  if (loader_started) { atomic_store(&loader_stop, 1); pthread_join(loader_thread, NULL); }
+  OrtSession* pending = atomic_exchange(&pending_session, NULL);
+  OrtSession* retired = atomic_exchange(&retired_session, NULL);
+  if (pending) MB_VOID(MB_RELEASE, g_ort->ReleaseSession(pending));
+  if (retired) MB_VOID(MB_RELEASE, g_ort->ReleaseSession(retired));
   if (redis_ctx) redisFree(redis_ctx);
-  if (ort_session) g_ort->ReleaseSession(ort_session);
+  if (getenv("AFL_NN_METRICS")) {
+    FILE* metrics = fopen(getenv("AFL_NN_METRICS"), "w");
+    if (metrics) {
+      fprintf(metrics, "decisions,forwards,errors,elapsed_us,mean_sum,std_sum,score_sum,skipped\n%llu,%llu,%llu,%llu,%.9f,%.9f,%.9f,%llu\n",
+        nn_decision_count, nn_forward_count, nn_error_count, nn_elapsed_us,
+        nn_mean_sum, nn_std_sum, nn_score_sum, total_skipped_paths);
+      fclose(metrics);
+    }
+  }
+  if (ort_session) MB_VOID(MB_RELEASE, g_ort->ReleaseSession(ort_session));
   if (ort_env) g_ort->ReleaseEnv(ort_env);
   /* =============================== */
 
@@ -8566,6 +8721,7 @@ stop_fuzzing:
 
   OKF("We're done here. Have a nice day!\n");
 
+  mb_flush();
   exit(0);
 
 }

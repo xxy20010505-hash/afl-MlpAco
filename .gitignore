@@ -18,3 +18,9 @@ afl-llvm-pass.so
 afl-llvm-rt-32.o
 afl-llvm-rt-64.o
 afl-llvm-rt.o
+
+# Local/generated profiling artifacts
+__pycache__/
+*.py[cod]
+validation/out-*/
+validation/**/work/

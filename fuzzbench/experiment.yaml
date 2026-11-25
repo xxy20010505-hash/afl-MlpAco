@@ -1,0 +1,15 @@
+description: MLPACO throughput diagnosis, legacy argv versus persistent argv
+local_experiment: true
+max_total_time: 43200
+snapshot_period: 60
+trials: 1
+runner_num_cpu_cores: 1
+runner_memory: 12GB
+fuzzers:
+- afl
+- afl_mlpaco_probe_legacy_files
+- afl_mlpaco_probe_persistent
+- afl_mlpaco_revision_probe_legacy_files
+- afl_mlpaco_revision_probe_persistent
+benchmarks:
+- libpng_libpng_read_fuzzer

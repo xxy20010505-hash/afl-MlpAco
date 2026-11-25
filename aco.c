@@ -1,3 +1,4 @@
+#include "micro_profile.h"
 /*
    aco.c - Implementation of 2D ACO for Mutation Scheduling
    Combined Version: Structs + Full Hyperparameters
@@ -13,7 +14,7 @@
 #define PHEROMONE_INITIAL 1.0     // 初始信息素
 #define ALPHA             1.0     // 信息素重要程度 (History weight)
 #define BETA              1.5     // 启发式因子重要程度 (Heuristic weight)
-#define EVAPORATION_RATE  0.1     // 挥发率 (Rho)
+#define EVAPORATION_RATE  0.0001     // 挥发率 (Rho)
 #define REWARD_BIG        5.0     // 发现新路径的奖励 (Q/L for new path)
 #define REWARD_SMALL      1.0     // 发现新元组计数的奖励 (Q/L for new hits)
 #define MIN_PHEROMONE     0.1     // 信息素下限 (防止概率为0)
@@ -42,6 +43,22 @@ typedef struct {
 
 /* 全局单例 */
 static AntColony g_colony;
+static double evaporation_rate = EVAPORATION_RATE;
+static double exploration_epsilon;
+static double history_gamma = 0.999;
+static int recent_history;
+static double recent_hits[ACO_OP_COUNT], recent_tries[ACO_OP_COUNT];
+
+static double read_unit_parameter(const char* name, double fallback, int allow_one) {
+    const char* raw = getenv(name);
+    if (!raw) return fallback;
+    char* end = NULL; double value = strtod(raw, &end);
+    if (!*raw || *end || !isfinite(value) || value < 0 ||
+        (allow_one ? value > 1 : value >= 1)) {
+        fprintf(stderr, "Invalid %s\n", name); exit(1);
+    }
+    return value;
+}
 
 /* --- 辅助函数 --- */
 
@@ -52,7 +69,23 @@ static inline double get_rand_double() {
 /* 初始化函数 */
 void ACO_init(void) {
     int i, j;
+    const char* configured_rho = getenv("AFL_ACO_RHO");
+    evaporation_rate = EVAPORATION_RATE;
+    if (configured_rho) {
+      char* end = NULL;
+      double value = strtod(configured_rho, &end);
+      if (!*configured_rho || *end || !isfinite(value) || value < 0 || value >= 1) {
+        fprintf(stderr, "Invalid AFL_ACO_RHO: expected 0 <= rho < 1\n");
+        exit(1);
+      }
+      evaporation_rate = value;
+    }
     
+    recent_history = getenv("AFL_ACO_RECENT") && atoi(getenv("AFL_ACO_RECENT"));
+    exploration_epsilon = read_unit_parameter("AFL_ACO_EPSILON", 0, 1);
+    history_gamma = read_unit_parameter("AFL_ACO_GAMMA", 0.999, 0);
+    memset(recent_hits, 0, sizeof(recent_hits));
+    memset(recent_tries, 0, sizeof(recent_tries));
     // 1. 初始化信息素矩阵
     for (i = 0; i <= ACO_OP_COUNT; i++) {
         for (j = 0; j < ACO_OP_COUNT; j++) {
@@ -67,18 +100,21 @@ void ACO_init(void) {
     // 3. 初始化当前蚂蚁
     g_colony.current_ant.length = 0;
     
-    printf("[ACO] Initialized: Alpha=%.1f, Beta=%.1f, Rho=%.1f\n", ALPHA, BETA, EVAPORATION_RATE);
+    printf("[ACO] Initialized: Alpha=%.1f, Beta=%.1f, Rho=%.4f\n", ALPHA, BETA, evaporation_rate);
 }
 
 /* 计算启发式因子 (Heuristic Factor) */
 /* 逻辑：算子 J 的历史胜率 (Hits / Tries) */
 static double calculate_heuristic(u32 op_idx) {
+    if (recent_history)
+        return (recent_hits[op_idx] + 1.0) / (recent_tries[op_idx] + 2.0);
     if (g_colony.heuristic_tries[op_idx] == 0) return 0.5; // 冷启动给予中等概率
     return (double)g_colony.heuristic_hits[op_idx] / (double)g_colony.heuristic_tries[op_idx];
 }
 
 /* 核心：选择下一个算子 */
 u32 ACO_SelectOperator(u32 prev_op) {
+  MB_SCOPE(MB_ACO_SELECT);
     double probabilities[ACO_OP_COUNT];
     double sum_prob = 0.0;
     int i;
@@ -109,6 +145,12 @@ u32 ACO_SelectOperator(u32 prev_op) {
         return selection;
     }
 
+    if (exploration_epsilon > 0) {
+        for (i = 0; i < ACO_OP_COUNT; ++i)
+            probabilities[i] = (1.0 - exploration_epsilon) * probabilities[i] / sum_prob
+                               + exploration_epsilon / ACO_OP_COUNT;
+        sum_prob = 1.0;
+    }
     double r = get_rand_double() * sum_prob;
     double current_sum = 0.0;
     u32 selected_op = 0;
@@ -137,6 +179,7 @@ u32 ACO_SelectOperator(u32 prev_op) {
    reward_level: 0=无, 1=小奖, 2=大奖
 */
 void ACO_NotifyFeedback(u32* dummy_seq, u32 dummy_len, u8 reward_level) {
+  MB_SCOPE(MB_ACO_UPDATE);
     // 注意：有了结构体后，前两个参数其实没用了，可以直接读取 g_colony.current_ant
     // 但为了保持头文件接口兼容，这里保留参数位置，但不使用它。
     
@@ -145,6 +188,22 @@ void ACO_NotifyFeedback(u32* dummy_seq, u32 dummy_len, u8 reward_level) {
     // 无论是否有奖励，处理完后都要重置蚂蚁长度，为下一次 havoc 做准备
     g_colony.current_ant.length = 0;
 
+    if (recent_history) {
+        for (int j = 0; j < ACO_OP_COUNT; ++j) {
+            recent_hits[j] *= history_gamma;
+            recent_tries[j] *= history_gamma;
+        }
+        for (u32 j = 0; j < len; ++j) {
+            u32 op = g_colony.current_ant.path[j];
+            recent_tries[op] += 1.0;
+            if (reward_level) recent_hits[op] += 1.0;
+        }
+    }
+    if (!getenv("AFL_NO_EVAPORATION"))
+      for (int row = 0; row <= ACO_OP_COUNT; ++row)
+        for (int col = 0; col < ACO_OP_COUNT; ++col)
+          g_colony.pheromone[row][col] = fmax(MIN_PHEROMONE,
+            g_colony.pheromone[row][col] * (1.0 - evaporation_rate));
     if (reward_level == 0) return; // 无奖励，不更新 (保持稀疏性)
 
     // 确定奖励值
@@ -168,7 +227,7 @@ void ACO_NotifyFeedback(u32* dummy_seq, u32 dummy_len, u8 reward_level) {
         // 这里的逻辑：
         // 挥发：模拟随时间消逝
         // 增强：加上本次的奖励
-        double new_tau = (1.0 - EVAPORATION_RATE) * old_tau + reward_val;
+        double new_tau = old_tau + reward_val;
         
         // 3. 限制范围 (Clamping)
         if (new_tau > MAX_PHEROMONE) new_tau = MAX_PHEROMONE;
@@ -179,3 +238,4 @@ void ACO_NotifyFeedback(u32* dummy_seq, u32 dummy_len, u8 reward_level) {
         prev = curr;
     }
 }
+void ACO_ResetSequence(void) { g_colony.current_ant.length = 0; }
